@@ -1,0 +1,3 @@
+#!/bin/sh
+echo '=== Husky Pre-Push validation checking... ==='
+make lint && make test

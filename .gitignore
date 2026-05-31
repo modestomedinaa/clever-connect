@@ -1,0 +1,51 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+clever-connect
+clever-connect-client
+clever-connect-server
+
+# Go dependency and coverage files
+*.out
+*.test
+*.prof
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# Node.js
+node_modules/
+dist/
+build/
+.eslintcache
+.stylelintcache
+*.log
+bun.lockb
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# IDE / System files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
