@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
     unzip \
     nginx \
     gzip \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Install stable Go 1.22.3
@@ -75,15 +76,22 @@ RUN mkdir -p data && chmod 777 data
 COPY nginx.conf /etc/nginx/nginx.conf
 
 # ==========================================
-# PHASE 4: INSTALL GOST (SOCKS5 PROXY)
+# PHASE 4: INSTALL GOST (SOCKS5 PROXY) & MEDIAMTX
 # ==========================================
 # Download and install Gost to handle the decrypted traffic from Ehco
 RUN curl -L https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz | gzip -d > /usr/local/bin/gost && \
     chmod +x /usr/local/bin/gost
 
+# Download and install MediaMTX for high performance video streaming
+RUN curl -L https://github.com/bluenviron/mediamtx/releases/download/v1.9.0/mediamtx_v1.9.0_linux_amd64.tar.gz | tar -xz -C /usr/local/bin/ mediamtx && \
+    chmod +x /usr/local/bin/mediamtx
+
+# Copy MediaMTX config
+COPY mediamtx.yml /etc/mediamtx.yml
+
 # Default environment configuration (Clever Cloud will override these)
 ENV APP_MODE=server
 ENV PORT=8080
 
-# Start Nginx in background, launch Gost socks5 relayer in background, set Gin port to 3000, and exec main binary directly (PID 1)
-CMD service nginx start && /usr/local/bin/gost -L socks5://127.0.0.1:10805 & export PORT=3000 && exec ./bin/clever-connect
+# Start Nginx in background, launch Gost, launch MediaMTX, set Gin port to 3000, and exec main binary directly (PID 1)
+CMD service nginx start && /usr/local/bin/gost -L socks5://127.0.0.1:10805 & /usr/local/bin/mediamtx /etc/mediamtx.yml & export PORT=3000 && exec ./bin/clever-connect

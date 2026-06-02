@@ -8,6 +8,8 @@ import {
 	FiPlay, FiPause, FiMaximize2, FiChevronLeft
 } from 'react-icons/fi';
 import Editor from '@monaco-editor/react';
+import videojs from 'video.js';
+import 'video.js/dist/video-js.css';
 
 interface FileItem {
 	name: string;
@@ -62,6 +64,49 @@ const formatSize = (bytes: number): string => {
 	const sizes = ['Bytes', 'KB', 'MB', 'GB'];
 	const i = Math.floor(Math.log(bytes) / Math.log(k));
 	return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+};
+
+interface VideoJSPlayerProps {
+	options: any;
+	onReady?: (player: any) => void;
+}
+
+const VideoJSPlayer: React.FC<VideoJSPlayerProps> = ({ options, onReady }) => {
+	const videoRef = useRef<HTMLDivElement | null>(null);
+	const playerRef = useRef<any>(null);
+
+	useEffect(() => {
+		if (!playerRef.current && videoRef.current) {
+			const videoElement = document.createElement("video-js");
+			videoElement.classList.add('vjs-big-play-centered');
+			videoElement.classList.add('vjs-theme-vod-modal');
+			videoRef.current.appendChild(videoElement);
+
+			const player = playerRef.current = videojs(videoElement, options, () => {
+				onReady && onReady(player);
+			});
+		} else if (playerRef.current) {
+			const player = playerRef.current;
+			player.autoplay(options.autoplay);
+			player.src(options.sources);
+		}
+	}, [options]);
+
+	useEffect(() => {
+		const player = playerRef.current;
+		return () => {
+			if (player && !player.isDisposed()) {
+				player.dispose();
+				playerRef.current = null;
+			}
+		};
+	}, []);
+
+	return (
+		<div data-vjs-player style={{ width: '100%', height: '100%' }}>
+			<div ref={videoRef} style={{ width: '100%', height: '100%' }} />
+		</div>
+	);
 };
 
 export const FilesPage: React.FC = () => {
@@ -1096,14 +1141,44 @@ export const FilesPage: React.FC = () => {
 							)}
 
 							{/* Video Player */}
-							{previewType === 'video' && (
+							{previewType === 'video' && previewFile && (
 								<div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 10, overflow: 'hidden' }}>
-									<div style={{ flex: 1, background: '#000', borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}>
-										<video 
-											controls 
-											src={`/api/files/stream?path=${encodeURIComponent(currentPath === '/' ? `/${previewFile.name}` : `${currentPath}/${previewFile.name}`)}&token=${encodeURIComponent(token || '')}`}
-											style={{ width: '100%', height: '100%', borderRadius: 8 }}
-											playsInline
+									<style>{`
+										.vjs-theme-vod-modal.video-js {
+											width: 100% !important;
+											height: 100% !important;
+										}
+										.vjs-theme-vod-modal .vjs-big-play-button {
+											background-color: var(--color-brand) !important;
+											border: none !important;
+											border-radius: 50% !important;
+											box-shadow: 0 4px 12px rgba(99,102,241,0.3) !important;
+										}
+									`}</style>
+									<div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+										<button 
+											className="btn btn--sm btn--primary" 
+											onClick={() => {
+												const targetPath = currentPath === '/' ? `/${previewFile.name}` : `${currentPath}/${previewFile.name}`;
+												window.open(`/player?path=${encodeURIComponent(targetPath)}`, '_blank');
+											}}
+											style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+										>
+											<FiMaximize2 size={13} /> Open in Cinema Mode (New Tab)
+										</button>
+									</div>
+									<div style={{ flex: 1, background: '#000', borderRadius: 8, overflow: 'hidden', position: 'relative' }}>
+										<VideoJSPlayer 
+											options={{
+												autoplay: true,
+												controls: true,
+												responsive: true,
+												fluid: false,
+												sources: [{
+													src: `/api/files/stream?path=${encodeURIComponent(currentPath === '/' ? `/${previewFile.name}` : `${currentPath}/${previewFile.name}`)}&token=${encodeURIComponent(token || '')}`,
+													type: 'video/mp4'
+												}]
+											}}
 										/>
 									</div>
 								</div>
