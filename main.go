@@ -8,6 +8,7 @@ import (
 
 	"clever-connect/internal/config"
 	"clever-connect/internal/db"
+	"clever-connect/internal/downloader"
 	"clever-connect/internal/ehcocore"
 	"clever-connect/internal/handlers"
 	"clever-connect/internal/logger"
@@ -38,6 +39,11 @@ func main() {
 	// Initialize Database
 	database := db.InitDB(cfg)
 	_ = database // keep reference
+
+	// Initialize Downloader Engine on server only
+	if cfg.AppMode == "server" {
+		downloader.Init()
+	}
 
 	// Auto-start active tunnel engine on bootstrap
 	if cfg.AppMode == "server" {
@@ -75,6 +81,7 @@ func main() {
 	wsHandler := handlers.NewWSHandler(cfg)
 	ehcoHandler := handlers.NewEhcoHandler(cfg)
 	fileHandler := handlers.NewFileHandler(cfg)
+	leechHandler := handlers.NewLeechHandler(cfg)
 
 	// API Group
 	api := router.Group("/api")
@@ -114,6 +121,15 @@ func main() {
 			protected.POST("/files/copy", fileHandler.CopyItem)
 			protected.POST("/files/compress", fileHandler.CompressItems)
 			protected.POST("/files/decompress", fileHandler.DecompressItem)
+
+			// Remote Downloader (Leecher) API Endpoints
+			protected.GET("/leech/jobs", leechHandler.ListJobs)
+			protected.POST("/leech/add", leechHandler.AddJob)
+			protected.POST("/leech/pause", leechHandler.PauseJob)
+			protected.POST("/leech/start", leechHandler.StartJob)
+			protected.POST("/leech/delete", leechHandler.DeleteJob)
+			protected.GET("/leech/config", leechHandler.GetConfig)
+			protected.POST("/leech/config", leechHandler.SaveConfig)
 		}
 	}
 

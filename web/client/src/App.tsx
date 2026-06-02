@@ -10,6 +10,7 @@ const SettingsPage = lazy(() => import('./pages/SettingsPage').then(m => ({ defa
 const LogsPage = lazy(() => import('./pages/LogsPage').then(m => ({ default: m.LogsPage })));
 const EhcoClientPage = lazy(() => import('./pages/EhcoClientPage').then(m => ({ default: m.EhcoClientPage })));
 const FilesPage = lazy(() => import('./pages/FilesPage').then(m => ({ default: m.FilesPage })));
+const LeechPage = lazy(() => import('./pages/LeechPage').then(m => ({ default: m.LeechPage })));
 
 // Loading spinner
 const PageLoader = () => (
@@ -39,6 +40,7 @@ const ProtectedLayout: React.FC = () => {
     'fw-logs': ['System Logs', 'Diagnostics'],
     'ehco-tunnel': ['Protocol', 'Ehco'],
     files: ['Storage', 'Files Explorer'],
+    leech: ['Storage', 'Remote Leech Manager'],
   };
 
   // Inject user local preferences (Font and Theme) on initial bootstrap
@@ -92,6 +94,7 @@ const router = createBrowserRouter([
       { path: 'fw-logs', element: <LogsPage /> },
       { path: 'ehco-tunnel', element: <EhcoClientPage /> },
       { path: 'files', element: <FilesPage /> },
+      { path: 'leech', element: <LeechPage /> },
     ],
   },
   { path: '*', element: <Navigate to="/dashboard" replace /> },

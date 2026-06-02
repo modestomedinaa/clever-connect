@@ -4,7 +4,8 @@ import {
 	FiFolder, FiFile, FiUpload, FiPlus, FiTrash2, FiDownload, 
 	FiGrid, FiList, FiRefreshCw, FiArrowLeft, FiEdit3, 
 	FiImage, FiVideo, FiZoomIn, FiZoomOut, FiRotateCw, FiX, FiCheck,
-	FiChevronRight, FiChevronDown, FiScissors, FiCopy, FiClipboard, FiInfo, FiArchive, FiShare2
+	FiChevronRight, FiChevronDown, FiScissors, FiCopy, FiClipboard, FiInfo, FiArchive, FiShare2,
+	FiPlay, FiPause, FiMaximize2, FiChevronLeft
 } from 'react-icons/fi';
 import Editor from '@monaco-editor/react';
 
@@ -45,6 +46,48 @@ export const FilesPage: React.FC = () => {
 	const [diskTotal, setDiskTotal] = useState<number>(0);
 	const [diskFree, setDiskFree] = useState<number>(0);
 	const [diskUsed, setDiskUsed] = useState<number>(0);
+
+	// Lightbox Gallery States
+	const [isLightboxOpen, setIsLightboxOpen] = useState<boolean>(false);
+	const [lightboxIndex, setLightboxIndex] = useState<number>(0);
+	const [isPlaying, setIsPlaying] = useState<boolean>(false);
+
+	const imageFiles = files.filter(f => getFileCategory(f.extension) === 'image' && !f.is_dir);
+
+	// Auto-play Slideshow handler
+	useEffect(() => {
+		let timer: any;
+		if (isPlaying && isLightboxOpen && imageFiles.length > 1) {
+			timer = setInterval(() => {
+				setLightboxIndex(prev => (prev + 1) % imageFiles.length);
+			}, 3000);
+		}
+		return () => {
+			if (timer) clearInterval(timer);
+		};
+	}, [isPlaying, isLightboxOpen, imageFiles.length]);
+
+	// Keyboard Navigation for Lightbox Gallery
+	useEffect(() => {
+		const handleKeyDown = (e: KeyboardEvent) => {
+			if (!isLightboxOpen || imageFiles.length === 0) return;
+			if (e.key === 'ArrowRight') {
+				setLightboxIndex(prev => (prev + 1) % imageFiles.length);
+				setIsPlaying(false);
+			} else if (e.key === 'ArrowLeft') {
+				setLightboxIndex(prev => (prev - 1 + imageFiles.length) % imageFiles.length);
+				setIsPlaying(false);
+			} else if (e.key === 'Escape') {
+				setIsLightboxOpen(false);
+				setIsPlaying(false);
+			} else if (e.key === ' ') {
+				e.preventDefault();
+				setIsPlaying(prev => !prev);
+			}
+		};
+		window.addEventListener('keydown', handleKeyDown);
+		return () => window.removeEventListener('keydown', handleKeyDown);
+	}, [isLightboxOpen, imageFiles.length]);
 
 	// Active Preview States
 	const [previewFile, setPreviewFile] = useState<FileItem | null>(null);
@@ -1006,6 +1049,29 @@ export const FilesPage: React.FC = () => {
 											position: 'relative'
 										}}
 									>
+										{previewFile && (
+											<button 
+												className="btn btn--sm btn--primary" 
+												onClick={() => {
+													const idx = imageFiles.findIndex(f => f.name === previewFile.name);
+													if (idx !== -1) {
+														setLightboxIndex(idx);
+														setIsLightboxOpen(true);
+													}
+												}}
+												style={{
+													position: 'absolute',
+													top: 10,
+													right: 10,
+													zIndex: 5,
+													display: 'flex',
+													alignItems: 'center',
+													gap: 6
+												}}
+											>
+												<FiMaximize2 size={13} /> Full Screen Gallery
+											</button>
+										)}
 										<img 
 											src={`/api/files/stream?path=${encodeURIComponent(currentPath === '/' ? `/${previewFile.name}` : `${currentPath}/${previewFile.name}`)}&token=${encodeURIComponent(token || '')}`} 
 											alt={previewFile.name}
@@ -1213,6 +1279,288 @@ export const FilesPage: React.FC = () => {
 								Copy to Clipboard
 							</button>
 							<button className="btn" onClick={() => setShowShareModal(false)}>Close</button>
+						</div>
+					</div>
+				</div>
+			)}
+
+			{/* Advanced Lightbox Gallery Overlay */}
+			{isLightboxOpen && imageFiles.length > 0 && (
+				<div 
+					style={{
+						position: 'fixed',
+						top: 0,
+						left: 0,
+						width: '100vw',
+						height: '100vh',
+						background: 'rgba(10,12,18,0.96)',
+						backdropFilter: 'blur(16px)',
+						zIndex: 9999,
+						display: 'flex',
+						flexDirection: 'column',
+						color: '#fff',
+						animation: 'fadeIn 0.25s ease-out'
+					}}
+				>
+					<style>{`
+						@keyframes fadeIn {
+							from { opacity: 0; }
+							to { opacity: 1; }
+						}
+						@keyframes slideFadeIn {
+							from { opacity: 0; transform: scale(0.97) translateY(8px); }
+							to { opacity: 1; transform: scale(1) translateY(0); }
+						}
+						.lightbox-arrow:hover {
+							background: rgba(255,255,255,0.18) !important;
+							transform: scale(1.05);
+						}
+					`}</style>
+
+					{/* Top Header Bar */}
+					<div 
+						style={{
+							display: 'flex',
+							justifyContent: 'space-between',
+							alignItems: 'center',
+							padding: '16px 24px',
+							background: 'linear-gradient(to bottom, rgba(0,0,0,0.5), transparent)',
+							borderBottom: '1px solid rgba(255,255,255,0.05)'
+						}}
+					>
+						<div style={{ display: 'flex', flexDirection: 'column' }}>
+							<span style={{ fontSize: 14, fontWeight: 700, letterSpacing: '0.2px' }}>
+								{imageFiles[lightboxIndex]?.name}
+							</span>
+							<span style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', marginTop: 2 }}>
+								Image {lightboxIndex + 1} of {imageFiles.length} • {formatSize(imageFiles[lightboxIndex]?.size)}
+							</span>
+						</div>
+
+						{/* Action Buttons */}
+						<div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+							{/* Slideshow Play/Pause */}
+							<button 
+								onClick={() => setIsPlaying(prev => !prev)}
+								style={{
+									background: isPlaying ? 'var(--color-brand)' : 'rgba(255,255,255,0.08)',
+									border: 'none',
+									borderRadius: 20,
+									padding: '6px 14px',
+									color: '#fff',
+									fontSize: 12,
+									fontWeight: 600,
+									display: 'flex',
+									alignItems: 'center',
+									gap: 6,
+									cursor: 'pointer',
+									transition: 'background 0.2s'
+								}}
+							>
+								{isPlaying ? <FiPause size={12} /> : <FiPlay size={12} />}
+								{isPlaying ? 'Pause Slideshow' : 'Start Slideshow'}
+							</button>
+
+							{/* Fullscreen API Trigger */}
+							<button 
+								onClick={() => {
+									const container = document.getElementById('lightbox-image-stage');
+									if (container) {
+										if (!document.fullscreenElement) {
+											container.requestFullscreen().catch(err => console.error(err));
+										} else {
+											document.exitFullscreen();
+										}
+									}
+								}}
+								style={{
+									background: 'rgba(255,255,255,0.08)',
+									border: 'none',
+									borderRadius: '50%',
+									width: 34,
+									height: 34,
+									display: 'flex',
+									alignItems: 'center',
+									justifyContent: 'center',
+									color: '#fff',
+									cursor: 'pointer',
+									transition: 'background 0.2s'
+								}}
+								title="Fullscreen"
+							>
+								<FiMaximize2 size={14} />
+							</button>
+
+							{/* Close Button */}
+							<button 
+								onClick={() => {
+									setIsLightboxOpen(false);
+									setIsPlaying(false);
+								}}
+								style={{
+									background: 'rgba(239,68,68,0.15)',
+									border: 'none',
+									borderRadius: '50%',
+									width: 34,
+									height: 34,
+									display: 'flex',
+									alignItems: 'center',
+									justifyContent: 'center',
+									color: '#ef4444',
+									cursor: 'pointer',
+									transition: 'background 0.2s'
+								}}
+								title="Close Lightbox"
+							>
+								<FiX size={16} />
+							</button>
+						</div>
+					</div>
+
+					{/* Main Display Stage */}
+					<div 
+						id="lightbox-image-stage"
+						style={{
+							flex: 1,
+							display: 'flex',
+							alignItems: 'center',
+							justifyContent: 'center',
+							position: 'relative',
+							overflow: 'hidden',
+							background: '#000'
+						}}
+					>
+						{/* Left Arrow Button */}
+						<button 
+							onClick={() => setLightboxIndex(prev => (prev - 1 + imageFiles.length) % imageFiles.length)}
+							style={{
+								position: 'absolute',
+								left: 20,
+								zIndex: 10,
+								background: 'rgba(255,255,255,0.08)',
+								border: 'none',
+								borderRadius: '50%',
+								width: 48,
+								height: 48,
+								display: 'flex',
+								alignItems: 'center',
+								justifyContent: 'center',
+								color: '#fff',
+								cursor: 'pointer',
+								transition: 'all 0.2s'
+							}}
+							className="lightbox-arrow"
+						>
+							<FiChevronLeft size={24} />
+						</button>
+
+						{/* Image Container with dynamic keys to trigger keyframe transition animations */}
+						<div 
+							key={lightboxIndex} 
+							style={{
+								maxWidth: '90%',
+								maxHeight: '90%',
+								display: 'flex',
+								alignItems: 'center',
+								justifyContent: 'center',
+								animation: 'slideFadeIn 0.35s cubic-bezier(0.16, 1, 0.3, 1)'
+							}}
+						>
+							<img 
+								src={`/api/files/stream?path=${encodeURIComponent(currentPath === '/' ? `/${imageFiles[lightboxIndex]?.name}` : `${currentPath}/${imageFiles[lightboxIndex]?.name}`)}&token=${encodeURIComponent(token || '')}`} 
+								alt={imageFiles[lightboxIndex]?.name}
+								style={{
+									maxWidth: '100%',
+									maxHeight: '100%',
+									objectFit: 'contain',
+									boxShadow: '0 12px 40px rgba(0,0,0,0.8)',
+									borderRadius: 6
+								}}
+							/>
+						</div>
+
+						{/* Right Arrow Button */}
+						<button 
+							onClick={() => setLightboxIndex(prev => (prev + 1) % imageFiles.length)}
+							style={{
+								position: 'absolute',
+								right: 20,
+								zIndex: 10,
+								background: 'rgba(255,255,255,0.08)',
+								border: 'none',
+								borderRadius: '50%',
+								width: 48,
+								height: 48,
+								display: 'flex',
+								alignItems: 'center',
+								justifyContent: 'center',
+								color: '#fff',
+								cursor: 'pointer',
+								transition: 'all 0.2s'
+							}}
+							className="lightbox-arrow"
+						>
+							<FiChevronRight size={24} />
+						</button>
+					</div>
+
+					{/* Bottom Thumbnail Strip - Gallery */}
+					<div 
+						style={{
+							padding: '16px 20px',
+							background: 'rgba(10,12,18,0.98)',
+							borderTop: '1px solid rgba(255,255,255,0.05)',
+							display: 'flex',
+							justifyContent: 'center',
+							alignItems: 'center'
+						}}
+					>
+						<div 
+							style={{
+								display: 'flex',
+								gap: 10,
+								overflowX: 'auto',
+								maxWidth: '90%',
+								padding: '4px 0',
+								scrollbarWidth: 'thin'
+							}}
+						>
+							{imageFiles.map((file, idx) => {
+								const isSelected = idx === lightboxIndex;
+								const pathStr = currentPath === '/' ? `/${file.name}` : `${currentPath}/${file.name}`;
+								return (
+									<div 
+										key={file.name}
+										onClick={() => {
+											setLightboxIndex(idx);
+											setIsPlaying(false);
+										}}
+										style={{
+											width: 60,
+											height: 60,
+											borderRadius: 6,
+											overflow: 'hidden',
+											cursor: 'pointer',
+											border: isSelected ? '2.5px solid var(--color-brand)' : '1.5px solid rgba(255,255,255,0.15)',
+											opacity: isSelected ? 1 : 0.5,
+											transition: 'all 0.2s',
+											flexShrink: 0,
+											transform: isSelected ? 'scale(1.08)' : 'scale(1)'
+										}}
+									>
+										<img 
+											src={`/api/files/stream?path=${encodeURIComponent(pathStr)}&token=${encodeURIComponent(token || '')}`}
+											alt={file.name}
+											loading="lazy" 
+											style={{
+												width: '100%',
+												height: '100%',
+												objectFit: 'cover'
+											}}
+										/>
+									</div>
+								);
+							})}
 						</div>
 					</div>
 				</div>

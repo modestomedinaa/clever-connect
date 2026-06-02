@@ -23,6 +23,7 @@ const navItems = [
     id: 'files-section', label: 'Files', icon: FiFolder,
     children: [
       { id: 'files', label: 'File manager' },
+      { id: 'leech', label: 'Leech manager' },
     ]
   },
   {

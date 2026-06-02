@@ -59,3 +59,33 @@ type EhcoClientConfig struct {
 	BridgeURL    string `json:"bridge_url"`
 	BridgeSNI    string `json:"bridge_sni"`
 }
+
+// LeechConfig stores the advanced settings for the download manager
+type LeechConfig struct {
+	gorm.Model
+	DefaultSavePath string `json:"default_save_path" gorm:"default:'/downloads'"`
+	MaxConcurrent   int    `json:"max_concurrent" gorm:"default:3"`
+	ThreadsPerJob   int    `json:"threads_per_job" gorm:"default:8"`
+	UserAgent       string `json:"user_agent" gorm:"default:'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0'"`
+	ProxyURL        string `json:"proxy_url"` // Optional HTTP/SOCKS5 proxy
+}
+
+// LeechJob tracks individual remote download tasks
+type LeechJob struct {
+	ID            string    `gorm:"primaryKey" json:"id"`
+	URL           string    `gorm:"type:text;not null" json:"url"`
+	Filename      string    `json:"filename"`
+	SaveDirectory string    `json:"save_directory"`
+	TotalBytes    int64     `json:"total_bytes"`
+	Downloaded    int64     `json:"downloaded"`
+	Status        string    `json:"status" gorm:"default:'pending'"` // pending, downloading, paused, completed, error
+	Progress      float64   `json:"progress"` // 0.0 to 100.0
+	Speed         float64   `json:"speed"`    // MB/s
+	Threads       int       `json:"threads"`
+	Username      string    `json:"username"`
+	Password      string    `json:"password"`
+	ErrorMessage  string    `json:"error_message"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
