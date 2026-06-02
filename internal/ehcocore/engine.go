@@ -33,8 +33,7 @@ type RelayConfig struct {
 	Listen        string        `json:"listen"`
 	ListenType    string        `json:"listen_type"`
 	TransportType string        `json:"transport_type"`
-	TCPRemotes    []string      `json:"tcp_remotes"`
-	UDPRemotes    []string      `json:"udp_remotes,omitempty"`
+	Remotes       []string      `json:"remotes"`
 	Options       *RelayOptions `json:"options,omitempty"`
 }
 
@@ -118,8 +117,7 @@ func StartServerEngine(dbCfg *models.EhcoServerConfig) error {
 				Listen:        "127.0.0.1:" + dbCfg.ListenPort,
 				ListenType:    "ws",
 				TransportType: "raw",
-				TCPRemotes:    []string{dbCfg.TargetHost},
-				UDPRemotes:    []string{dbCfg.TargetHost},
+				Remotes:       []string{dbCfg.TargetHost},
 				Options: &RelayOptions{
 					EnableUDP:          true,
 					EnableMultipathTCP: true,
@@ -265,8 +263,7 @@ func StartClientEngine(dbCfg *models.EhcoClientConfig) error {
 				Listen:        "127.0.0.1:" + dbCfg.LocalPort,
 				ListenType:    "raw",
 				TransportType: transportType,
-				TCPRemotes:    []string{baseAddr},
-				UDPRemotes:    []string{baseAddr},
+				Remotes:       []string{baseAddr},
 				Options: &RelayOptions{
 					EnableUDP:          true,
 					EnableMultipathTCP: true,
