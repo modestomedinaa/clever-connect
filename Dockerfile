@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     ca-certificates \
     unzip \
+    nginx \
     && rm -rf /var/lib/apt/lists/*
 
 # Install stable Go 1.22.3
@@ -67,12 +68,15 @@ RUN cd web/server && bun run build
 # Compile Go backend binary with embedded distributions
 RUN go build -o bin/clever-connect main.go
 
-# Expose ports
-EXPOSE 8080
-EXPOSE 8081
+# Copy Nginx config
+COPY nginx.conf /etc/nginx/nginx.conf
+
+# Create a startup script to run both Nginx and Gin
+RUN printf '#!/bin/bash\nservice nginx start\nexport PORT=3000\n./bin/clever-connect\n' > start.sh
+RUN chmod +x start.sh
 
 # Default environment configuration (Clever Cloud will override these)
 ENV APP_MODE=server
 ENV PORT=8080
 
-CMD ["./bin/clever-connect"]
+CMD ["./start.sh"]
