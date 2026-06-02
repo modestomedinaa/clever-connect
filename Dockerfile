@@ -68,6 +68,12 @@ RUN cd web/server && bun run build
 # Compile Go backend binary with embedded distributions
 RUN go build -o bin/clever-connect main.go
 
+# Compile the Ehco binary so it's baked into the image
+RUN go build -o bin/ehco github.com/Ehco1996/ehco/cmd/ehco
+
+# Create the data directory for dynamic JSON configs and ensure permissions
+RUN mkdir -p data && chmod 777 data
+
 # Copy Nginx config
 COPY nginx.conf /etc/nginx/nginx.conf
 

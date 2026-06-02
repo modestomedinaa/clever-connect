@@ -55,23 +55,20 @@ var (
 func EnsureBinary() error {
 	binPath := "bin/ehco"
 	if _, err := os.Stat(binPath); err == nil {
-		return nil
+		return nil // File found, no compilation needed
 	}
 
 	logger.Info("Ehco", "ehco binary missing. Starting automatic self-compilation.")
 	
-	// Create bin folder if not exists
 	if err := os.MkdirAll("bin", 0755); err != nil {
 		return fmt.Errorf("failed to create bin directory: %w", err)
 	}
 
-	// Run go build
 	buildCmd := exec.Command("go", "build", "-o", binPath, "github.com/Ehco1996/ehco/cmd/ehco")
-	buildCmd.Stdout = os.Stdout
-	buildCmd.Stderr = os.Stderr
 	
-	if err := buildCmd.Run(); err != nil {
-		return fmt.Errorf("failed to compile ehco: %w", err)
+	out, err := buildCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to compile ehco: %w\nCompiler Output:\n%s", err, string(out))
 	}
 
 	logger.Info("Ehco", "ehco binary compiled successfully", "path", binPath)
