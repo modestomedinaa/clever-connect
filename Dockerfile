@@ -68,6 +68,9 @@ RUN cd web/server && bun run build
 # Compile Go backend binary with embedded distributions
 RUN go build -o bin/clever-connect main.go
 
+# Resolve transitive dependencies of Ehco to populate go.sum dynamically
+RUN go get github.com/Ehco1996/ehco/cmd/ehco
+
 # Compile the Ehco binary so it's baked into the image
 RUN go build -o bin/ehco github.com/Ehco1996/ehco/cmd/ehco
 
