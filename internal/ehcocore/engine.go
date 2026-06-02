@@ -10,27 +10,30 @@ import (
 	"sync"
 
 	"clever-connect/internal/logger"
+	"clever-connect/internal/models"
 
 	_ "github.com/Ehco1996/ehco/pkg/xray"
 )
 
-// Ehco JSON Config schemas
+// Ehco JSON Config schemas matching its internal structure
 type WSConfig struct {
-	Path string `json:"path,omitempty"`
+	Path       string `json:"path,omitempty"`
+	RemoteAddr string `json:"remote_addr,omitempty"`
 }
 
 type RelayOptions struct {
 	EnableUDP          bool      `json:"enable_udp,omitempty"`
 	EnableMultipathTCP bool      `json:"enable_multipath_tcp,omitempty"`
 	WSConfig           *WSConfig `json:"ws_config,omitempty"`
+	IdleTimeoutSec     int       `json:"idle_timeout_sec,omitempty"`
+	DialTimeoutSec     int       `json:"dial_timeout_sec,omitempty"`
 }
 
 type RelayConfig struct {
 	Listen        string        `json:"listen"`
 	ListenType    string        `json:"listen_type"`
 	TransportType string        `json:"transport_type"`
-	TCPRemotes    []string      `json:"tcp_remotes"`
-	UDPRemotes    []string      `json:"udp_remotes,omitempty"`
+	Remotes       []string      `json:"remotes"`
 	Options       *RelayOptions `json:"options,omitempty"`
 }
 
@@ -51,23 +54,20 @@ var (
 func EnsureBinary() error {
 	binPath := "bin/ehco"
 	if _, err := os.Stat(binPath); err == nil {
-		return nil
+		return nil // File found, no compilation needed
 	}
 
 	logger.Info("Ehco", "ehco binary missing. Starting automatic self-compilation.")
 	
-	// Create bin folder if not exists
 	if err := os.MkdirAll("bin", 0755); err != nil {
 		return fmt.Errorf("failed to create bin directory: %w", err)
 	}
 
-	// Run go build
 	buildCmd := exec.Command("go", "build", "-o", binPath, "github.com/Ehco1996/ehco/cmd/ehco")
-	buildCmd.Stdout = os.Stdout
-	buildCmd.Stderr = os.Stderr
 	
-	if err := buildCmd.Run(); err != nil {
-		return fmt.Errorf("failed to compile ehco: %w", err)
+	out, err := buildCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to compile ehco: %w\nCompiler Output:\n%s", err, string(out))
 	}
 
 	logger.Info("Ehco", "ehco binary compiled successfully", "path", binPath)
@@ -75,7 +75,7 @@ func EnsureBinary() error {
 }
 
 // StartServerEngine launches the ehco relayer using Server DB configs
-func StartServerEngine(listenPort, token, targetHost string) error {
+func StartServerEngine(dbCfg *models.EhcoServerConfig) error {
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -89,8 +89,21 @@ func StartServerEngine(listenPort, token, targetHost string) error {
 
 	// Format secure auth path
 	authPath := "/tunnel"
-	if token != "" {
-		authPath = "/tunnel/" + token
+	if dbCfg.AuthToken != "" {
+		authPath = "/tunnel/" + dbCfg.AuthToken
+	}
+
+	// Configure query params for Multiplexing if active
+	if dbCfg.EnableMux {
+		authPath += "?mux=true"
+	} else {
+		authPath += "?mux=false"
+	}
+
+	// Default keep-alive interval
+	idleTimeout := dbCfg.KeepAlive
+	if idleTimeout <= 0 {
+		idleTimeout = 15
 	}
 
 	// Build JSON config
@@ -101,14 +114,14 @@ func StartServerEngine(listenPort, token, targetHost string) error {
 		LogLevel:   "info",
 		RelayConfigs: []*RelayConfig{
 			{
-				Listen:        "127.0.0.1:" + listenPort,
+				Listen:        "127.0.0.1:" + dbCfg.ListenPort,
 				ListenType:    "ws",
 				TransportType: "raw",
-				TCPRemotes:    []string{targetHost},
-				UDPRemotes:    []string{targetHost},
+				Remotes:       []string{dbCfg.TargetHost},
 				Options: &RelayOptions{
 					EnableUDP:          true,
 					EnableMultipathTCP: true,
+					IdleTimeoutSec:     idleTimeout,
 					WSConfig: &WSConfig{
 						Path: authPath,
 					},
@@ -132,7 +145,12 @@ func StartServerEngine(listenPort, token, targetHost string) error {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
-	logger.Info("Ehco", "Starting Server Tunnel Process", "listen_port", listenPort, "target_host", targetHost)
+	logger.Info("Ehco", "Starting Server Tunnel Process", 
+		"listen_port", dbCfg.ListenPort, 
+		"target_host", dbCfg.TargetHost,
+		"enable_mux", dbCfg.EnableMux,
+		"keep_alive", idleTimeout,
+	)
 
 	// Launch process
 	cmdInstance = exec.Command("bin/ehco", "-c", configPath)
@@ -150,7 +168,7 @@ func StartServerEngine(listenPort, token, targetHost string) error {
 }
 
 // StartClientEngine runs locally, capturing a local port and proxying to the remote Clever Cloud WebSocket tunnel
-func StartClientEngine(localPort, remoteURL, token string) error {
+func StartClientEngine(dbCfg *models.EhcoClientConfig) error {
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -165,13 +183,13 @@ func StartClientEngine(localPort, remoteURL, token string) error {
 	transportType := "wss"
 	baseAddr := "wss://127.0.0.1:8080"
 	authPath := "/tunnel"
-	if token != "" {
-		authPath = "/tunnel/" + token
+	if dbCfg.AuthToken != "" {
+		authPath = "/tunnel/" + dbCfg.AuthToken
 	}
 
 	// Parse remoteURL
-	if remoteURL != "" {
-		urlToParse := remoteURL
+	if dbCfg.RemoteURL != "" {
+		urlToParse := dbCfg.RemoteURL
 		if !strings.Contains(urlToParse, "://") {
 			urlToParse = "wss://" + urlToParse
 		}
@@ -202,11 +220,36 @@ func StartClientEngine(localPort, remoteURL, token string) error {
 			if path == "" || path == "/" {
 				path = "/tunnel"
 			}
-			if token != "" && !strings.HasSuffix(path, token) {
-				path = strings.TrimSuffix(path, "/") + "/" + token
+			if dbCfg.AuthToken != "" && !strings.HasSuffix(path, dbCfg.AuthToken) {
+				path = strings.TrimSuffix(path, "/") + "/" + dbCfg.AuthToken
 			}
 			authPath = path
 		}
+	}
+
+	// Configure query parameters for Multiplexing and SNI Spoofing
+	params := url.Values{}
+	if dbCfg.EnableMux {
+		params.Add("mux", "true")
+	} else {
+		params.Add("mux", "false")
+	}
+
+	if dbCfg.SNI != "" {
+		params.Add("sni", dbCfg.SNI)
+	}
+
+	// Add params to WS Path query string
+	if strings.Contains(authPath, "?") {
+		authPath += "&" + params.Encode()
+	} else {
+		authPath += "?" + params.Encode()
+	}
+
+	// Default keep-alive interval
+	idleTimeout := dbCfg.KeepAlive
+	if idleTimeout <= 0 {
+		idleTimeout = 15
 	}
 
 	// Build JSON config
@@ -217,14 +260,14 @@ func StartClientEngine(localPort, remoteURL, token string) error {
 		LogLevel:   "info",
 		RelayConfigs: []*RelayConfig{
 			{
-				Listen:        "127.0.0.1:" + localPort,
+				Listen:        "127.0.0.1:" + dbCfg.LocalPort,
 				ListenType:    "raw",
 				TransportType: transportType,
-				TCPRemotes:    []string{baseAddr},
-				UDPRemotes:    []string{baseAddr},
+				Remotes:       []string{baseAddr},
 				Options: &RelayOptions{
 					EnableUDP:          true,
 					EnableMultipathTCP: true,
+					IdleTimeoutSec:     idleTimeout,
 					WSConfig: &WSConfig{
 						Path: authPath,
 					},
@@ -248,7 +291,15 @@ func StartClientEngine(localPort, remoteURL, token string) error {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
-	logger.Info("Ehco", "Starting Client Tunnel Process", "local_port", localPort, "remote_url", baseAddr, "path", authPath)
+	logger.Info("Ehco", "Starting Client Tunnel Process", 
+		"local_port", dbCfg.LocalPort, 
+		"remote_url", baseAddr, 
+		"path", authPath,
+		"sni", dbCfg.SNI,
+		"enable_mux", dbCfg.EnableMux,
+		"keep_alive", idleTimeout,
+		"bypass_ir", dbCfg.BypassIR,
+	)
 
 	// Launch process
 	cmdInstance = exec.Command("bin/ehco", "-c", configPath)

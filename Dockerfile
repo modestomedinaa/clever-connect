@@ -40,27 +40,20 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 # ==========================================
-# PHASE 2: CACHE CLIENT NODE DEPENDENCIES
-# ==========================================
-# Copy package.json / bun.lock for client
-COPY web/client/package.json web/client/bun.lock ./web/client/
-RUN cd web/client && bun install
-
-# ==========================================
-# PHASE 3: CACHE SERVER NODE DEPENDENCIES
+# PHASE 2: CACHE SERVER NODE DEPENDENCIES
 # ==========================================
 # Copy package.json / bun.lock for server
 COPY web/server/package.json web/server/bun.lock ./web/server/
 RUN cd web/server && bun install
 
 # ==========================================
-# PHASE 4: COPY CODEBASE & COMPILE
+# PHASE 3: COPY CODEBASE & COMPILE
 # ==========================================
-# Now copy the actual source code (which changes often)
+# Now copy the actual source code
 COPY . .
 
-# Compile Client SPA Frontend
-RUN cd web/client && bun run build
+# Create empty placeholder for client dist to satisfy go:embed when compiling the binary
+RUN mkdir -p web/client/dist && touch web/client/dist/index.html
 
 # Compile Server SPA Frontend
 RUN cd web/server && bun run build
@@ -68,15 +61,21 @@ RUN cd web/server && bun run build
 # Compile Go backend binary with embedded distributions
 RUN go build -o bin/clever-connect main.go
 
+# Resolve transitive dependencies of Ehco to populate go.sum dynamically
+RUN go get github.com/Ehco1996/ehco/cmd/ehco
+
+# Compile the Ehco binary so it's baked into the image
+RUN go build -o bin/ehco github.com/Ehco1996/ehco/cmd/ehco
+
+# Create the data directory for dynamic JSON configs and ensure permissions
+RUN mkdir -p data && chmod 777 data
+
 # Copy Nginx config
 COPY nginx.conf /etc/nginx/nginx.conf
-
-# Create a startup script to run both Nginx and Gin
-RUN printf '#!/bin/bash\nservice nginx start\nexport PORT=3000\n./bin/clever-connect\n' > start.sh
-RUN chmod +x start.sh
 
 # Default environment configuration (Clever Cloud will override these)
 ENV APP_MODE=server
 ENV PORT=8080
 
-CMD ["./start.sh"]
+# Start Nginx in background, set Gin port to 3000, and run Go backend directly as main process (PID 1)
+CMD service nginx start && export PORT=3000 && exec ./bin/clever-connect
