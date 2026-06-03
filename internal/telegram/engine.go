@@ -120,54 +120,62 @@ func StartEngine(cfg *models.TelegramConfig) error {
 		startedAt:  time.Now(),
 	}
 
+	// Initialize gotd client for MTProto operations
+	appID := cfg.AppID
+	if appID == 0 {
+		appID = 2040
+	}
+	appHash := cfg.AppHash
+	if appHash == "" {
+		appHash = "b18441a1ff607e10a989891a5624e0d4"
+	}
+
+	sessionDir := filepath.Join("./data/manager", ".telegram")
+	_ = os.MkdirAll(sessionDir, 0755)
+	
+	var sessionPath string
 	if cfg.AuthType == "user" {
-		// Initialize gotd client for User Account
-		appID := cfg.AppID
-		if appID == 0 {
-			appID = 2040
-		}
-		appHash := cfg.AppHash
-		if appHash == "" {
-			appHash = "b18441a1ff607e10a989891a5624e0d4"
-		}
-
-		sessionDir := filepath.Join("./data/manager", ".telegram")
-		_ = os.MkdirAll(sessionDir, 0755)
-		sessionPath := filepath.Join(sessionDir, "session.json")
-
+		sessionPath = filepath.Join(sessionDir, "session.json")
 		// Check if session file exists
 		if _, err := os.Stat(sessionPath); os.IsNotExist(err) {
 			cancel()
 			return fmt.Errorf("user session file does not exist. Please authenticate first via admin panel")
 		}
+	} else {
+		sessionPath = filepath.Join(sessionDir, "session_bot.json")
+	}
 
-		d := tg.NewUpdateDispatcher()
-		gaps := updates.New(updates.Config{
-			Handler: d,
-		})
+	d := tg.NewUpdateDispatcher()
+	gaps := updates.New(updates.Config{
+		Handler: d,
+	})
 
-		opts := telegram.Options{
-			SessionStorage: &telegram.FileSessionStorage{
-				Path: sessionPath,
-			},
-			UpdateHandler: gaps,
-			Middlewares: []telegram.Middleware{
-				updhook.UpdateHook(gaps.Handle),
-			},
+	opts := telegram.Options{
+		SessionStorage: &telegram.FileSessionStorage{
+			Path: sessionPath,
+		},
+	}
+
+	if cfg.AuthType == "user" {
+		opts.UpdateHandler = gaps
+		opts.Middlewares = []telegram.Middleware{
+			updhook.UpdateHook(gaps.Handle),
 		}
+	}
 
-		if cfg.MTProtoServer != "" {
-			if strings.Contains(cfg.MTProtoServer, "149.154.167.40") || strings.Contains(strings.ToLower(cfg.MTProtoServer), "test") {
-				opts.DCList = dcs.Test()
-			}
+	if cfg.MTProtoServer != "" {
+		if strings.Contains(cfg.MTProtoServer, "149.154.167.40") || strings.Contains(strings.ToLower(cfg.MTProtoServer), "test") {
+			opts.DCList = dcs.Test()
 		}
+	}
 
-		client := telegram.NewClient(appID, appHash, opts)
-		eng.gotdClient = client
-		eng.gotdCtx = ctx
-		eng.gotdCancel = cancel
+	client := telegram.NewClient(appID, appHash, opts)
+	eng.gotdClient = client
+	eng.gotdCtx = ctx
+	eng.gotdCancel = cancel
 
-		// Register gotd commands and updates
+	if cfg.AuthType == "user" {
+		// Register gotd commands and updates for user mode
 		d.OnNewMessage(func(ctx context.Context, entities tg.Entities, u *tg.UpdateNewMessage) error {
 			eng.Dispatch(func() {
 				if err := eng.handleUserMessage(ctx, entities, u); err != nil {
@@ -185,56 +193,79 @@ func StartEngine(cfg *models.TelegramConfig) error {
 			})
 			return nil
 		})
+	}
 
-		// Start gotd client
-		eng.running.Store(true)
-		errChan := make(chan error, 1)
-		go func() {
-			err := client.Run(ctx, func(ctx context.Context) error {
-				self, err := client.Self(ctx)
+	// Start gotd client
+	eng.running.Store(true)
+	gotdErrChan := make(chan error, 1)
+	go func() {
+		err := client.Run(ctx, func(ctx context.Context) error {
+			// Perform bot authentication if in bot mode
+			if cfg.AuthType == "bot" {
+				status, err := client.Auth().Status(ctx)
 				if err != nil {
 					return err
 				}
-				eng.mu.Lock()
+				if !status.Authorized {
+					logger.Info("Telegram", "Authenticating gotd client as bot via MTProto...")
+					_, err = client.Auth().Bot(ctx, cfg.BotToken)
+					if err != nil {
+						return err
+					}
+				}
+			}
+
+			self, err := client.Self(ctx)
+			if err != nil {
+				return err
+			}
+			
+			eng.mu.Lock()
+			if cfg.AuthType == "user" {
 				eng.meUsername = self.Username
 				eng.meID = self.ID
 				eng.meFirstName = self.FirstName
-				eng.mu.Unlock()
-
-				logger.Info("Telegram", "User account engine running",
-					"username", self.Username,
-					"id", self.ID,
-				)
-
-				// Signal success
-				errChan <- nil
-
-				<-ctx.Done()
-				return nil
-			})
-			if err != nil && !errors.Is(err, context.Canceled) {
-				logger.Error("Telegram", "MTProto client run failed", "error", err)
-				eng.running.Store(false)
-				select {
-				case errChan <- err:
-				default:
-				}
 			}
-		}()
+			eng.mu.Unlock()
 
-		// Wait for start confirmation or error
-		select {
-		case err := <-errChan:
-			if err != nil {
-				cancel()
-				return err
+			logger.Info("Telegram", "MTProto client running",
+				"username", self.Username,
+				"id", self.ID,
+				"mode", cfg.AuthType,
+			)
+
+			// Signal success
+			select {
+			case gotdErrChan <- nil:
+			default:
 			}
-		case <-time.After(10 * time.Second):
-			cancel()
-			return fmt.Errorf("timeout waiting for MTProto client to start")
+
+			<-ctx.Done()
+			return nil
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("Telegram", "MTProto client run failed", "error", err)
+			eng.running.Store(false)
+			select {
+			case gotdErrChan <- err:
+			default:
+			}
 		}
+	}()
 
-	} else {
+	// Wait for gotd client to start and connect
+	select {
+	case err := <-gotdErrChan:
+		if err != nil {
+			cancel()
+			return err
+		}
+	case <-time.After(15 * time.Second):
+		cancel()
+		return fmt.Errorf("timeout waiting for MTProto client to start")
+	}
+
+	if cfg.AuthType == "bot" {
 		// Bot Token mode (original telebot)
 		if cfg.BotToken == "" {
 			cancel()
@@ -261,7 +292,6 @@ func StartEngine(cfg *models.TelegramConfig) error {
 		eng.registerMiddleware()
 		eng.registerCommands()
 
-		eng.running.Store(true)
 		go func() {
 			logger.Info("Telegram", "Bot polling started", "username", bot.Me.Username)
 			bot.Start()
