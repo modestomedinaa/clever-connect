@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { FiSend, FiPlay, FiSquare, FiCheck, FiAlertCircle, FiRefreshCw, FiUsers, FiFile, FiSettings, FiZap, FiEye, FiEyeOff, FiCpu, FiActivity } from 'react-icons/fi';
+import { FiSend, FiPlay, FiSquare, FiCheck, FiAlertCircle, FiRefreshCw, FiUsers, FiFile, FiSettings, FiZap, FiEye, FiEyeOff, FiCpu, FiActivity, FiImage, FiRadio } from 'react-icons/fi';
 import { useAuthStore } from '../store/authStore';
 
 interface TelegramConfig {
@@ -28,7 +28,7 @@ interface BotStats {
 
 const defaultConfig: TelegramConfig = {
   bot_token: '', admin_user_ids: '', welcome_message: '👋 Welcome to *CleverConnect Bot*, {name}!\n\nUse /help to see available commands.',
-  polling_interval: 10, max_file_size: 50, enable_file_sharing: true, enable_notifications: true, is_active: false,
+  polling_interval: 10, max_file_size: 2000, enable_file_sharing: true, enable_notifications: true, is_active: false,
 };
 
 export const TelegramSettingsPage: React.FC = () => {
@@ -44,8 +44,65 @@ export const TelegramSettingsPage: React.FC = () => {
   const [starting, setStarting] = useState(false);
   const [testResult, setTestResult] = useState<{ success: boolean; bot_username?: string; error?: string } | null>(null);
   const [saveMsg, setSaveMsg] = useState('');
+  const [avatarFile, setAvatarFile] = useState<File | null>(null);
+  const [uploadingAvatar, setUploadingAvatar] = useState(false);
+  const [avatarMsg, setAvatarMsg] = useState('');
+  const [broadcastMsg, setBroadcastMsg] = useState('');
+  const [broadcasting, setBroadcasting] = useState(false);
+  const [broadcastResult, setBroadcastResult] = useState('');
 
   const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
+
+  const handleAvatarUpload = async () => {
+    if (!avatarFile) return;
+    setUploadingAvatar(true);
+    setAvatarMsg('');
+    try {
+      const formData = new FormData();
+      formData.append('avatar', avatarFile);
+      const res = await fetch('/api/telegram/set-avatar', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+        body: formData,
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setAvatarMsg('✅ Bot avatar updated successfully!');
+        setAvatarFile(null);
+        const fileInput = document.getElementById('avatar-input') as HTMLInputElement;
+        if (fileInput) fileInput.value = '';
+      } else {
+        setAvatarMsg(`❌ ${data.error}`);
+      }
+    } catch (e: any) {
+      setAvatarMsg('❌ ' + e.message);
+    }
+    setUploadingAvatar(false);
+  };
+
+  const handleBroadcast = async () => {
+    if (!broadcastMsg.trim()) return;
+    setBroadcasting(true);
+    setBroadcastResult('');
+    try {
+      const res = await fetch('/api/telegram/broadcast', {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify({ message: broadcastMsg }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setBroadcastResult(`✅ Broadcast initiated to ${data.subscribers_count} active subscriber(s).`);
+        setBroadcastMsg('');
+        setTimeout(() => setBroadcastResult(''), 5000);
+      } else {
+        setBroadcastResult(`❌ ${data.error}`);
+      }
+    } catch (e: any) {
+      setBroadcastResult('❌ ' + e.message);
+    }
+    setBroadcasting(false);
+  };
 
   const fetchConfig = useCallback(async () => {
     try {
@@ -208,6 +265,80 @@ export const TelegramSettingsPage: React.FC = () => {
                 </div>
               ))}
             </div>
+          </div>
+
+          {/* Bot Avatar Card */}
+          <div className="g-card animate-slide-in">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
+              <FiImage style={{ color: 'var(--color-brand)', fontSize: 18 }} />
+              <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--color-brand-heading)' }}>Bot Profile Avatar</span>
+            </div>
+            <p style={{ fontSize: 11, color: 'var(--color-brand-text)', marginBottom: 14 }}>
+              Set or update your Telegram bot's profile avatar. Supported formats: JPEG, PNG.
+            </p>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+              <input
+                id="avatar-input"
+                type="file"
+                accept="image/*"
+                onChange={e => setAvatarFile(e.target.files?.[0] || null)}
+                style={{
+                  flex: 1,
+                  fontSize: 12,
+                  color: 'var(--color-brand-text)',
+                  padding: '8px 12px',
+                  borderRadius: 8,
+                  border: '1px solid var(--color-brand-border)',
+                  background: 'var(--color-brand-bg)'
+                }}
+              />
+              <button
+                className="btn btn--sm btn--primary"
+                onClick={handleAvatarUpload}
+                disabled={uploadingAvatar || !avatarFile}
+                style={{ height: 38, whiteSpace: 'nowrap' }}
+              >
+                {uploadingAvatar ? 'Uploading...' : 'Set Avatar'}
+              </button>
+            </div>
+            {avatarMsg && (
+              <div style={{ marginTop: 10, fontSize: 12, color: avatarMsg.startsWith('✅') ? '#10b981' : '#ef4444' }}>
+                {avatarMsg}
+              </div>
+            )}
+          </div>
+
+          {/* Broadcast Card */}
+          <div className="g-card animate-slide-in">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
+              <FiRadio style={{ color: 'var(--color-brand)', fontSize: 18 }} />
+              <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--color-brand-heading)' }}>Subscriber Broadcast</span>
+            </div>
+            <p style={{ fontSize: 11, color: 'var(--color-brand-text)', marginBottom: 12 }}>
+              Broadcast a markdown message to all Telegram users who have started your bot.
+            </p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <textarea
+                value={broadcastMsg}
+                onChange={e => setBroadcastMsg(e.target.value)}
+                placeholder="Type your broadcast message (Markdown supported)..."
+                rows={3}
+                style={{ ...inputStyle, resize: 'vertical', fontSize: 12 }}
+              />
+              <button
+                className="btn btn--sm btn--primary"
+                onClick={handleBroadcast}
+                disabled={broadcasting || !broadcastMsg.trim() || !running}
+                style={{ width: '100%', padding: '10px 0' }}
+              >
+                {broadcasting ? 'Broadcasting...' : '📢 Send Broadcast'}
+              </button>
+            </div>
+            {broadcastResult && (
+              <div style={{ marginTop: 10, fontSize: 12, color: broadcastResult.startsWith('✅') ? '#10b981' : '#ef4444' }}>
+                {broadcastResult}
+              </div>
+            )}
           </div>
 
           {/* Save Button */}

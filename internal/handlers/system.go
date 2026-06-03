@@ -1,6 +1,11 @@
 package handlers
 
 import (
+	"image"
+	"image/color"
+	_ "image/gif"
+	_ "image/jpeg"
+	"image/png"
 	"net/http"
 	"os"
 	"runtime"
@@ -15,6 +20,7 @@ import (
 	"github.com/shirou/gopsutil/v3/host"
 	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/shirou/gopsutil/v3/net"
+	_ "golang.org/x/image/webp"
 )
 
 type SystemStats struct {
@@ -211,4 +217,93 @@ func GetSystemStatsData() SystemStats {
 	statsMu.RLock()
 	defer statsMu.RUnlock()
 	return statsCached
+}
+
+// UploadFavicon handles POST /api/settings/favicon
+func UploadFavicon(c *gin.Context) {
+	file, err := c.FormFile("favicon")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No file uploaded"})
+		return
+	}
+
+	srcFile, err := file.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open uploaded file"})
+		return
+	}
+	defer srcFile.Close()
+
+	img, _, err := image.Decode(srcFile)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Unsupported image format. Please upload PNG, JPEG, GIF, or WEBP."})
+		return
+	}
+
+	// Resize to 32x32 for standard favicon
+	resized := resizeImage(img, 32, 32)
+
+	// Ensure data directory exists
+	if err := os.MkdirAll("data", 0755); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create data directory"})
+		return
+	}
+
+	// Save as data/favicon.png
+	outFile, err := os.Create("data/favicon.png")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save favicon on server"})
+		return
+	}
+	defer outFile.Close()
+
+	if err := png.Encode(outFile, resized); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to encode favicon to PNG"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "success", "message": "Favicon updated successfully"})
+}
+
+// ServeFavicon serves the custom favicon if it exists, else serves a default icon
+func ServeFavicon(c *gin.Context) {
+	if _, err := os.Stat("data/favicon.png"); err == nil {
+		c.File("data/favicon.png")
+		return
+	}
+
+	// Generate default favicon: 32x32 orange circle
+	img := image.NewRGBA(image.Rect(0, 0, 32, 32))
+	brandColor := color.RGBA{255, 107, 44, 255}
+	for y := 0; y < 32; y++ {
+		for x := 0; x < 32; x++ {
+			dx := x - 16
+			dy := y - 16
+			if dx*dx+dy*dy <= 16*16 {
+				img.Set(x, y, brandColor)
+			} else {
+				img.Set(x, y, color.Transparent)
+			}
+		}
+	}
+
+	c.Header("Content-Type", "image/png")
+	c.Header("Cache-Control", "public, max-age=31536000")
+	_ = png.Encode(c.Writer, img)
+}
+
+func resizeImage(src image.Image, width, height int) image.Image {
+	dst := image.NewRGBA(image.Rect(0, 0, width, height))
+	srcBounds := src.Bounds()
+	srcWidth := srcBounds.Dx()
+	srcHeight := srcBounds.Dy()
+
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			srcX := int(float64(x) / float64(width) * float64(srcWidth)) + srcBounds.Min.X
+			srcY := int(float64(y) / float64(height) * float64(srcHeight)) + srcBounds.Min.Y
+			dst.Set(x, y, src.At(srcX, srcY))
+		}
+	}
+	return dst
 }

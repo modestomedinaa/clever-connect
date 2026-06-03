@@ -21,6 +21,24 @@ func (e *Engine) registerCommands() {
 	e.Bot.Handle("/start", func(c tele.Context) error {
 		e.commandsProcessed.Add(1)
 
+		// Register or activate subscriber
+		var sub models.TelegramSubscriber
+		if err := db.DB.Where("chat_id = ?", c.Chat().ID).First(&sub).Error; err != nil {
+			sub = models.TelegramSubscriber{
+				ChatID:    c.Chat().ID,
+				Username:  c.Sender().Username,
+				FirstName: c.Sender().FirstName,
+				Active:    true,
+			}
+			db.DB.Create(&sub)
+		} else {
+			db.DB.Model(&sub).Updates(map[string]interface{}{
+				"active":     true,
+				"username":   c.Sender().Username,
+				"first_name": c.Sender().FirstName,
+			})
+		}
+
 		e.mu.RLock()
 		welcome := e.Config.WelcomeMessage
 		e.mu.RUnlock()
@@ -36,6 +54,18 @@ func (e *Engine) registerCommands() {
 		return c.Send(welcome, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 	})
 
+	// ────────────────── /stop ──────────────────
+	e.Bot.Handle("/stop", func(c tele.Context) error {
+		e.commandsProcessed.Add(1)
+
+		var sub models.TelegramSubscriber
+		if err := db.DB.Where("chat_id = ?", c.Chat().ID).First(&sub).Error; err == nil {
+			db.DB.Model(&sub).Update("active", false)
+		}
+
+		return c.Send("❌ *You have stopped the bot.*\n\nYou will no longer receive system notification broadcasts. Use `/start` to resubscribe at any time.", &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+	})
+
 	// ────────────────── /help ──────────────────
 	e.Bot.Handle("/help", func(c tele.Context) error {
 		e.commandsProcessed.Add(1)
@@ -43,7 +73,8 @@ func (e *Engine) registerCommands() {
 		isAdmin := e.IsAdmin(c.Sender().ID)
 
 		help := "🤖 *CleverConnect Bot Commands*\n\n"
-		help += "📌 `/start` — Welcome message\n"
+		help += "📌 `/start` — Welcome message & subscribe\n"
+		help += "🛑 `/stop` — Unsubscribe from broadcasts\n"
 		help += "❓ `/help` — This help menu\n"
 		help += "📊 `/status` — Bot & server status\n"
 		help += "🆔 `/myid` — Get your Telegram user ID\n"
@@ -278,10 +309,13 @@ func seedTelegramConfig() {
 		logger.Info("Telegram", "Seeding default Telegram bot configuration")
 		db.DB.Create(&models.TelegramConfig{
 			PollingInterval:     10,
-			MaxFileSize:         50,
+			MaxFileSize:         2000,
 			EnableFileSharing:   true,
 			EnableNotifications: true,
 			WelcomeMessage:      "👋 Welcome to *CleverConnect Bot*, {name}!\n\nUse /help to see available commands.",
 		})
+	} else if cfg.MaxFileSize == 50 {
+		logger.Info("Telegram", "Upgrading default MaxFileSize from 50MB to 2000MB")
+		db.DB.Model(&cfg).Update("max_file_size", 2000)
 	}
 }

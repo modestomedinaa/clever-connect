@@ -2,7 +2,9 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"sync"
@@ -74,6 +76,28 @@ func Init() {
 
 		// Register built-in job types
 		Engine.registerBuiltinJobs()
+
+		// Initialize QueueUploadJob in telegram package
+		telegram.QueueUploadJob = func(filePath string, chatID int64) error {
+			payload := telegram.TelegramUploadPayload{
+				FilePath: filePath,
+				ChatID:   chatID,
+			}
+			payloadBytes, err := json.Marshal(payload)
+			if err != nil {
+				return err
+			}
+			_, err = Engine.SubmitJob(
+				"telegram_upload",
+				fmt.Sprintf("Upload %s", filepath.Base(filePath)),
+				fmt.Sprintf("Parallel upload of %s to Telegram", filepath.Base(filePath)),
+				"files",
+				5,
+				string(payloadBytes),
+				"",
+			)
+			return err
+		}
 
 		// Reset stale "running" jobs from a previous crash
 		db.DB.Model(&models.SchedulerJob{}).

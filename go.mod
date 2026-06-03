@@ -18,6 +18,7 @@ require (
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/urfave/cli/v2 v2.27.7
 	golang.org/x/crypto v0.52.0
+	golang.org/x/image v0.41.0
 	golang.org/x/time v0.15.0
 	gopkg.in/telebot.v4 v4.0.0-beta.9
 	gorm.io/driver/mysql v1.6.0

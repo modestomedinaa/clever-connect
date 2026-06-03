@@ -1,12 +1,15 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"clever-connect/internal/config"
 	"clever-connect/internal/db"
@@ -128,7 +131,7 @@ func (h *TelegramHandler) GetConfig(c *gin.Context) {
 	var cfg models.TelegramConfig
 	if err := db.DB.First(&cfg).Error; err != nil {
 		c.JSON(http.StatusOK, gin.H{
-			"config":  models.TelegramConfig{PollingInterval: 10, MaxFileSize: 50, EnableFileSharing: true, EnableNotifications: true},
+			"config":  models.TelegramConfig{PollingInterval: 10, MaxFileSize: 2000, EnableFileSharing: true, EnableNotifications: true},
 			"running": false,
 		})
 		return
@@ -173,7 +176,7 @@ func (h *TelegramHandler) SaveConfig(c *gin.Context) {
 		req.PollingInterval = 10
 	}
 	if req.MaxFileSize < 1 {
-		req.MaxFileSize = 50
+		req.MaxFileSize = 2000
 	}
 
 	var existing models.TelegramConfig
@@ -368,5 +371,130 @@ func (h *TelegramHandler) SendFile(c *gin.Context) {
 		"status":  "success",
 		"message": "File upload job queued in scheduler",
 		"job_id":  job.ID,
+	})
+}
+
+// SetBotAvatar updates the Telegram bot profile picture (avatar).
+// POST /api/telegram/set-avatar
+func (h *TelegramHandler) SetBotAvatar(c *gin.Context) {
+	if h.proxyToServer(c) {
+		return
+	}
+
+	file, err := c.FormFile("avatar")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No file uploaded"})
+		return
+	}
+
+	var cfg models.TelegramConfig
+	if err := db.DB.First(&cfg).Error; err != nil || cfg.BotToken == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Telegram bot is not configured"})
+		return
+	}
+
+	srcFile, err := file.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open uploaded file"})
+		return
+	}
+	defer srcFile.Close()
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("photo", file.Filename)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create multipart form field"})
+		return
+	}
+
+	if _, err := io.Copy(part, srcFile); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to copy file data to request body"})
+		return
+	}
+	writer.Close()
+
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/setBotProfilePhoto", cfg.BotToken)
+	req, err := http.NewRequest("POST", url, body)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create API request"})
+		return
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send request to Telegram API: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	respBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Telegram API returned error: " + string(respBytes)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "success",
+		"message": "Bot avatar updated successfully",
+	})
+}
+
+// BroadcastMessage sends a message to all active subscribers.
+// POST /api/telegram/broadcast
+func (h *TelegramHandler) BroadcastMessage(c *gin.Context) {
+	if h.proxyToServer(c) {
+		return
+	}
+
+	var req struct {
+		Message string `json:"message" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Message content is required"})
+		return
+	}
+
+	eng := telegram.GetEngine()
+	if eng == nil || !telegram.IsRunning() || eng.Bot == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Telegram Bot engine is not running"})
+		return
+	}
+
+	var subs []models.TelegramSubscriber
+	if err := db.DB.Where("active = ?", true).Find(&subs).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch subscribers"})
+		return
+	}
+
+	if len(subs) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"status":            "success",
+			"message":           "No active subscribers to broadcast to",
+			"subscribers_count": 0,
+		})
+		return
+	}
+
+	// Run broadcast in background
+	go func(subs []models.TelegramSubscriber, msgText string) {
+		logger.Info("Telegram", "Starting broadcast to subscribers", "count", len(subs))
+		for _, sub := range subs {
+			_, err := eng.Bot.Send(tele.ChatID(sub.ChatID), msgText, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+			if err != nil {
+				logger.Error("Telegram", "Failed to send broadcast to subscriber", "chat_id", sub.ChatID, "error", err)
+			}
+			// Rate limiting delay
+			time.Sleep(35 * time.Millisecond)
+		}
+		logger.Info("Telegram", "Broadcast completed successfully")
+	}(subs, req.Message)
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":            "success",
+		"message":           fmt.Sprintf("Broadcast initiated successfully to %d active subscribers", len(subs)),
+		"subscribers_count": len(subs),
 	})
 }

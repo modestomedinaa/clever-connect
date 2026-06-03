@@ -37,6 +37,27 @@ func (e *Engine) registerMiddleware() {
 		}
 	})
 
+	// Guard middleware — check if user is admin.
+	// Allow only /myid command so users can find their ID.
+	e.Bot.Use(func(next tele.HandlerFunc) tele.HandlerFunc {
+		return func(c tele.Context) error {
+			// Always allow /myid
+			if strings.HasPrefix(c.Text(), "/myid") {
+				return next(c)
+			}
+
+			if !e.IsAdmin(c.Sender().ID) {
+				logger.Warn("Telegram", "Unauthorized access blocked",
+					"user_id", c.Sender().ID,
+					"username", c.Sender().Username,
+					"text", c.Text(),
+				)
+				return c.Send("⛔ Access denied. You are not an authorized administrator.")
+			}
+			return next(c)
+		}
+	})
+
 	// Admin-only guard middleware for sensitive commands
 	// This is applied per-handler, not globally
 }

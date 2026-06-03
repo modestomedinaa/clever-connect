@@ -121,7 +121,7 @@ type TelegramConfig struct {
 	AdminUserIDs        string `json:"admin_user_ids" gorm:"type:text"`                // Comma-separated Telegram user IDs
 	WelcomeMessage      string `json:"welcome_message" gorm:"type:text"`
 	PollingInterval     int    `json:"polling_interval" gorm:"default:10"`              // Seconds between long-poll cycles
-	MaxFileSize         int    `json:"max_file_size" gorm:"default:50"`                 // Maximum file size in MB
+	MaxFileSize         int    `json:"max_file_size" gorm:"default:2000"`                 // Maximum file size in MB
 	EnableFileSharing   bool   `json:"enable_file_sharing" gorm:"default:true"`
 	EnableNotifications bool   `json:"enable_notifications" gorm:"default:true"`
 	IsActive            bool   `json:"is_active" gorm:"default:false"`                  // Whether the bot should auto-start
@@ -199,4 +199,13 @@ type SchedulerConfig struct {
 	PurgeAfterDays      int  `json:"purge_after_days" gorm:"default:30"`
 	EnableCronJobs      bool `json:"enable_cron_jobs" gorm:"default:true"`
 	EnableNotifications bool `json:"enable_notifications" gorm:"default:false"`
+}
+
+// TelegramSubscriber stores Telegram users who have interacted with the bot.
+type TelegramSubscriber struct {
+	gorm.Model
+	ChatID    int64  `gorm:"uniqueIndex;not null" json:"chat_id"`
+	Username  string `json:"username"`
+	FirstName string `json:"first_name"`
+	Active    bool   `gorm:"default:true" json:"active"`
 }

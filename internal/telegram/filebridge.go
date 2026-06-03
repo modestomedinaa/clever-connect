@@ -13,6 +13,9 @@ import (
 	tele "gopkg.in/telebot.v4"
 )
 
+// QueueUploadJob is a callback registered by the scheduler engine to queue Telegram upload jobs.
+var QueueUploadJob func(filePath string, chatID int64) error
+
 // fileManagerRoot is the base directory for the server file manager.
 // This matches the FileHandler's rootDir in handlers/files.go.
 var fileManagerRoot string
@@ -155,13 +158,24 @@ func (e *Engine) sendFileToChat(c tele.Context, filePath string) error {
 	maxSizeMB := e.Config.MaxFileSize
 	e.mu.RUnlock()
 	if maxSizeMB <= 0 {
-		maxSizeMB = 50
+		maxSizeMB = 2000
 	}
 	maxBytes := int64(maxSizeMB) * 1024 * 1024
 
 	if info.Size() > maxBytes {
 		return c.Send(fmt.Sprintf("❌ File too large (%s). Maximum allowed: %dMB.",
 			formatFileSize(info.Size()), maxSizeMB))
+	}
+
+	// Telegram standard Bot API limit is 50MB. If file is larger, upload via MTProto parallel uploader.
+	if info.Size() > 50*1024*1024 {
+		if QueueUploadJob != nil {
+			err := QueueUploadJob(filePath, c.Chat().ID)
+			if err != nil {
+				return c.Send("❌ Failed to queue parallel upload: " + err.Error())
+			}
+			return nil // The job handles progress/completion notifications
+		}
 	}
 
 	fileName := filepath.Base(safePath)

@@ -175,6 +175,9 @@ func main() {
 			protected.POST("/telegram/stop", telegramHandler.StopBot)
 			protected.GET("/telegram/status", telegramHandler.GetStatus)
 			protected.POST("/telegram/send-file", telegramHandler.SendFile)
+			protected.POST("/telegram/set-avatar", telegramHandler.SetBotAvatar)
+			protected.POST("/telegram/broadcast", telegramHandler.BroadcastMessage)
+			protected.POST("/settings/favicon", handlers.UploadFavicon)
 
 			// Enterprise Job Scheduler API Endpoints
 			protected.GET("/scheduler/jobs", schedulerHandler.ListJobs)
@@ -214,6 +217,9 @@ func main() {
 		}
 		logger.Info("Static", "Serving CleverConnect Client Panel UI")
 	}
+
+	router.GET("/favicon.ico", handlers.ServeFavicon)
+	router.GET("/favicon.png", handlers.ServeFavicon)
 
 	router.Use(serveEmbeddedSPA(embedFS))
 
