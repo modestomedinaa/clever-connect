@@ -13,6 +13,7 @@ import (
 	"clever-connect/internal/downloader"
 	"clever-connect/internal/logger"
 	"clever-connect/internal/models"
+	"clever-connect/internal/spotify"
 	"clever-connect/internal/torrent"
 	"clever-connect/internal/youtube"
 
@@ -322,6 +323,18 @@ func (h *WSHandler) ServeWSJobs(c *gin.Context) {
 				if cmd.JobID != "" && youtube.Manager != nil {
 					youtube.Manager.DeleteJob(cmd.JobID, cmd.DeleteFiles)
 				}
+			case "cancel_spotify":
+				if cmd.JobID != "" && spotify.Manager != nil {
+					spotify.Manager.CancelJob(cmd.JobID)
+				}
+			case "delete_spotify":
+				if cmd.JobID != "" && spotify.Manager != nil {
+					spotify.Manager.DeleteJob(cmd.JobID, cmd.DeleteFiles)
+				}
+			case "retry_spotify":
+				if cmd.JobID != "" && spotify.Manager != nil {
+					spotify.Manager.RetryJob(cmd.JobID)
+				}
 			}
 		}
 	}()
@@ -336,16 +349,19 @@ func (h *WSHandler) ServeWSJobs(c *gin.Context) {
 			var torrentList []models.TorrentJob
 			var leechList []models.LeechJob
 			var youtubeList []models.YouTubeJob
+			var spotifyList []models.SpotifyJob
 
 			// Fetch lists from database
 			_ = db.DB.Order("created_at desc").Find(&torrentList)
 			_ = db.DB.Order("created_at desc").Find(&leechList)
 			_ = db.DB.Order("created_at desc").Find(&youtubeList)
+			_ = db.DB.Order("created_at desc").Find(&spotifyList)
 
 			response := gin.H{
 				"torrents":    torrentList,
 				"leechJobs":   leechList,
 				"youtubeJobs": youtubeList,
+				"spotifyJobs": spotifyList,
 			}
 
 			if err := conn.WriteJSON(response); err != nil {
