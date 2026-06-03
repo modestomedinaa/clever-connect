@@ -593,24 +593,26 @@ func (e *Engine) sendFileToChatUser(ctx context.Context, entities tg.Entities, p
 	
 	var sendErr error
 	var mediaOption message.MediaOption
-	switch {
-	case isImageExt(ext):
+	mimeType := mime.TypeByExtension(ext)
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+
+	switch ext {
+	case ".jpg", ".jpeg", ".png", ".gif":
 		mediaOption = message.UploadedPhoto(fileObj, styling.Plain(caption))
-	case isVideoExt(ext):
+	case ".mp4":
 		doc := message.UploadedDocument(fileObj, styling.Plain(caption))
-		doc.Filename(fileName).Video()
-		mediaOption = doc
-	case isAudioExt(ext):
+		mediaOption = doc.MIME("video/mp4").Filename(fileName).Video().SupportsStreaming()
+	case ".mp3", ".m4a":
 		doc := message.UploadedDocument(fileObj, styling.Plain(caption))
-		doc.Filename(fileName).Audio()
-		mediaOption = doc
+		mediaOption = doc.MIME(mimeType).Filename(fileName).Audio()
+	case ".ogg", ".opus":
+		doc := message.UploadedDocument(fileObj, styling.Plain(caption))
+		mediaOption = doc.MIME(mimeType).Filename(fileName).Audio().Voice()
 	default:
 		doc := message.UploadedDocument(fileObj, styling.Plain(caption))
-		mimeType := mime.TypeByExtension(ext)
-		if mimeType != "" {
-			doc.MIME(mimeType)
-		}
-		doc.Filename(fileName)
+		doc.MIME(mimeType).Filename(fileName)
 		mediaOption = doc
 	}
 

@@ -179,10 +179,14 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 		}
 	}
 
-	// Prepare session file path
 	sessionDir := filepath.Join(fileManagerRoot, ".telegram")
 	_ = os.MkdirAll(sessionDir, 0755)
-	sessionPath := filepath.Join(sessionDir, "session.json")
+	var sessionPath string
+	if cfg.AuthType == "user" {
+		sessionPath = filepath.Join(sessionDir, "session.json")
+	} else {
+		sessionPath = filepath.Join(sessionDir, "session_bot.json")
+	}
 
 	appID := cfg.AppID
 	if appID == 0 {
@@ -339,17 +343,18 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 			mimeType = "application/octet-stream"
 		}
 
-		switch {
-		case isImageExt(ext):
+		switch ext {
+		case ".jpg", ".jpeg", ".png", ".gif":
 			mediaOption = message.UploadedPhoto(inputFile, styling.Plain(caption))
-		case isVideoExt(ext):
+		case ".mp4":
 			doc := message.UploadedDocument(inputFile, styling.Plain(caption))
-			doc.MIME(mimeType).Filename(fileName).Video()
-			mediaOption = doc
-		case isAudioExt(ext):
+			mediaOption = doc.MIME("video/mp4").Filename(fileName).Video().SupportsStreaming()
+		case ".mp3", ".m4a":
 			doc := message.UploadedDocument(inputFile, styling.Plain(caption))
-			doc.MIME(mimeType).Filename(fileName).Audio()
-			mediaOption = doc
+			mediaOption = doc.MIME(mimeType).Filename(fileName).Audio()
+		case ".ogg", ".opus":
+			doc := message.UploadedDocument(inputFile, styling.Plain(caption))
+			mediaOption = doc.MIME(mimeType).Filename(fileName).Audio().Voice()
 		default:
 			doc := message.UploadedDocument(inputFile, styling.Plain(caption))
 			doc.MIME(mimeType).Filename(fileName)
