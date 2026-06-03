@@ -3,6 +3,7 @@ package downloader
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -95,7 +96,7 @@ func (e *Engine) Close() {
 }
 
 // AddJob registers a new download task
-func (e *Engine) AddJob(downloadURL, saveDir, filename, username, password string, threads int) (string, error) {
+func (e *Engine) AddJob(downloadURL, saveDir, filename, username, password string, threads int, usePremium bool) (string, error) {
 	// Generate unique Job ID
 	jobID := fmt.Sprintf("job_%d", time.Now().UnixNano())
 
@@ -129,6 +130,7 @@ func (e *Engine) AddJob(downloadURL, saveDir, filename, username, password strin
 		Threads:       threads,
 		Username:      username,
 		Password:      password,
+		UsePremium:    usePremium,
 		Progress:      0,
 	}
 
@@ -136,7 +138,7 @@ func (e *Engine) AddJob(downloadURL, saveDir, filename, username, password strin
 		return "", err
 	}
 
-	logger.Info("Downloader", "Added new leech job with auth check", "id", jobID, "url", downloadURL)
+	logger.Info("Downloader", "Added new leech job with auth check", "id", jobID, "url", downloadURL, "premium", usePremium)
 	return jobID, nil
 }
 
@@ -164,9 +166,53 @@ func (e *Engine) StartJob(jobID string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	e.activeJobs[jobID] = cancel
 
+	var downloadURL = job.URL
+	var resolvedFilename = job.Filename
+
+	if job.UsePremium {
+		var cfg models.LeechConfig
+		if err := db.DB.First(&cfg).Error; err != nil || cfg.PremiumUserID == "" || cfg.PremiumAPIKey == "" {
+			cancel()
+			return fmt.Errorf("Premium.to credentials (User ID and API Key) are not configured in settings")
+		}
+
+		apiURL := fmt.Sprintf("http://api.premium.to/api/2/getfile.php?userid=%s&apikey=%s&link=%s",
+			url.QueryEscape(cfg.PremiumUserID),
+			url.QueryEscape(cfg.PremiumAPIKey),
+			url.QueryEscape(job.URL),
+		)
+
+		var httpClient *http.Client
+		if e.client != nil {
+			if hc, ok := e.client.HTTPClient.(*http.Client); ok {
+				httpClient = hc
+			}
+		}
+		if httpClient == nil {
+			httpClient = http.DefaultClient
+		}
+
+		resolvedURL, finalFilename, err := resolvePremiumURL(apiURL, httpClient)
+		if err != nil {
+			cancel()
+			return fmt.Errorf("failed to resolve premium.to link: %w", err)
+		}
+		downloadURL = resolvedURL
+		if finalFilename != "" && finalFilename != "getfile.php" {
+			resolvedFilename = finalFilename
+			db.DB.Model(&models.LeechJob{}).Where("id = ?", jobID).Update("filename", resolvedFilename)
+		}
+	}
+
 	// Create request
-	destPath := filepath.Join(absSaveDir, job.Filename)
-	req, err := grab.NewRequest(destPath, job.URL)
+	var destPath string
+	if resolvedFilename == "getfile.php" || resolvedFilename == "downloaded_file" || resolvedFilename == "" {
+		destPath = absSaveDir
+	} else {
+		destPath = filepath.Join(absSaveDir, resolvedFilename)
+	}
+
+	req, err := grab.NewRequest(destPath, downloadURL)
 	if err != nil {
 		cancel()
 		return err
@@ -255,13 +301,19 @@ func (e *Engine) monitorProgress(resp *grab.Response, jobID string, ctx context.
 			progress := 100 * resp.Progress()
 			speed := resp.BytesPerSecond() / (1024 * 1024) // MB/s
 
-			db.DB.Model(&models.LeechJob{}).Where("id = ?", jobID).Updates(map[string]interface{}{
+			updates := map[string]interface{}{
 				"status":      "downloading",
 				"downloaded":  bytesComplete,
 				"total_bytes": totalBytes,
 				"progress":    progress,
 				"speed":       speed,
-			})
+			}
+
+			if resp.Filename != "" {
+				updates["filename"] = filepath.Base(resp.Filename)
+			}
+
+			db.DB.Model(&models.LeechJob{}).Where("id = ?", jobID).Updates(updates)
 
 		case <-resp.Done:
 			var status = "completed"
@@ -274,6 +326,13 @@ func (e *Engine) monitorProgress(resp *grab.Response, jobID string, ctx context.
 				logger.Info("Downloader", "Leech job completed successfully", "id", jobID)
 			}
 
+			var job models.LeechJob
+			_ = db.DB.First(&job, "id = ?", jobID)
+			finalName := job.Filename
+			if resp.Filename != "" {
+				finalName = filepath.Base(resp.Filename)
+			}
+
 			db.DB.Model(&models.LeechJob{}).Where("id = ?", jobID).Updates(map[string]interface{}{
 				"status":        status,
 				"downloaded":    resp.BytesComplete(),
@@ -281,6 +340,7 @@ func (e *Engine) monitorProgress(resp *grab.Response, jobID string, ctx context.
 				"progress":      100.0,
 				"speed":         0.0,
 				"error_message": errMsg,
+				"filename":      finalName,
 			})
 
 			e.mu.Lock()
@@ -289,6 +349,83 @@ func (e *Engine) monitorProgress(resp *grab.Response, jobID string, ctx context.
 			return
 		}
 	}
+}
+
+// resolvePremiumURL follows premium.to redirects and parses response links and filenames
+func resolvePremiumURL(apiURL string, client *http.Client) (string, string, error) {
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return "", "", err
+	}
+
+	// Disable automatic redirect following to capture Location header
+	noRedirectClient := &http.Client{
+		Transport: client.Transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: 15 * time.Second,
+	}
+
+	resp, err := noRedirectClient.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusTemporaryRedirect || resp.StatusCode == http.StatusSeeOther {
+		loc := resp.Header.Get("Location")
+		if loc != "" {
+			filename := ""
+			if disp := resp.Header.Get("Content-Disposition"); disp != "" {
+				filename = parseContentDispositionFilename(disp)
+			}
+			if filename == "" {
+				parsed, err := url.Parse(loc)
+				if err == nil {
+					filename = filepath.Base(parsed.Path)
+				}
+			}
+			return loc, filename, nil
+		}
+	}
+
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	bodyStr := strings.TrimSpace(string(bodyBytes))
+
+	if strings.HasPrefix(bodyStr, "{") {
+		if strings.Contains(bodyStr, "\"error\"") || strings.Contains(bodyStr, "\"err\"") {
+			return "", "", fmt.Errorf("premium.to error response: %s", bodyStr)
+		}
+	}
+
+	if strings.HasPrefix(bodyStr, "http://") || strings.HasPrefix(bodyStr, "https://") {
+		filename := ""
+		parsed, err := url.Parse(bodyStr)
+		if err == nil {
+			filename = filepath.Base(parsed.Path)
+		}
+		return bodyStr, filename, nil
+	}
+
+	filename := ""
+	if disp := resp.Header.Get("Content-Disposition"); disp != "" {
+		filename = parseContentDispositionFilename(disp)
+	}
+	return apiURL, filename, nil
+}
+
+func parseContentDispositionFilename(disp string) string {
+	parts := strings.Split(disp, ";")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "filename=") {
+			filename := strings.TrimPrefix(part, "filename=")
+			filename = strings.Trim(filename, "\"")
+			return filename
+		}
+	}
+	return ""
 }
 
 // startQueueWorker runs a queue tick loop checking for pending downloads

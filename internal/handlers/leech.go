@@ -133,6 +133,7 @@ func (h *LeechHandler) AddJob(c *gin.Context) {
 		Threads       int    `json:"threads"`
 		Username      string `json:"username"`
 		Password      string `json:"password"`
+		UsePremium    bool   `json:"use_premium"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -144,7 +145,7 @@ func (h *LeechHandler) AddJob(c *gin.Context) {
 		input.Threads = 8
 	}
 
-	jobID, err := downloader.Manager.AddJob(input.URL, input.SaveDirectory, input.Filename, input.Username, input.Password, input.Threads)
+	jobID, err := downloader.Manager.AddJob(input.URL, input.SaveDirectory, input.Filename, input.Username, input.Password, input.Threads, input.UsePremium)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create leech job", "details": err.Error()})
 		return
@@ -250,6 +251,8 @@ func (h *LeechHandler) SaveConfig(c *gin.Context) {
 		cfg.ThreadsPerJob = input.ThreadsPerJob
 		cfg.UserAgent = input.UserAgent
 		cfg.ProxyURL = input.ProxyURL
+		cfg.PremiumUserID = input.PremiumUserID
+		cfg.PremiumAPIKey = input.PremiumAPIKey
 		db.DB.Save(&cfg)
 	} else {
 		db.DB.Create(&input)

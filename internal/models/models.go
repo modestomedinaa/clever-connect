@@ -68,6 +68,8 @@ type LeechConfig struct {
 	ThreadsPerJob   int    `json:"threads_per_job" gorm:"default:8"`
 	UserAgent       string `json:"user_agent" gorm:"default:'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0'"`
 	ProxyURL        string `json:"proxy_url"` // Optional HTTP/SOCKS5 proxy
+	PremiumUserID   string `json:"premium_user_id"`
+	PremiumAPIKey   string `json:"premium_api_key"`
 }
 
 // LeechJob tracks individual remote download tasks
@@ -84,6 +86,7 @@ type LeechJob struct {
 	Threads       int       `json:"threads"`
 	Username      string    `json:"username"`
 	Password      string    `json:"password"`
+	UsePremium    bool      `json:"use_premium" gorm:"default:false"`
 	ErrorMessage  string    `json:"error_message"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`

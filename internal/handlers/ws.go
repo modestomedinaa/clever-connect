@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math/rand"
 	"net/http"
+	"runtime"
 	"strings"
 	"time"
 
@@ -83,10 +84,19 @@ func (h *WSHandler) ServeWS(c *gin.Context) {
 				}
 			} else {
 				// Server Telemetry
-				cpu := rand.Intn(20) + 15
-				memory := 44 + rand.Intn(4) - 2
-				disk := 18
-				conns := 4
+				sysStats := GetSystemStatsData()
+				cpu := int(sysStats.CPUPercent)
+				memory := int(sysStats.MemPercent)
+				disk := int(sysStats.DiskPercent)
+
+				var activeLeechCount int64
+				db.DB.Model(&models.LeechJob{}).Where("status = ?", "downloading").Count(&activeLeechCount)
+
+				var activeTorrentCount int64
+				db.DB.Model(&models.TorrentJob{}).Count(&activeTorrentCount)
+
+				var activeSchedulerCount int64
+				db.DB.Model(&models.SchedulerJob{}).Where("status = ?", "running").Count(&activeSchedulerCount)
 
 				downloadSpeed := float64(rand.Intn(120) + 40) // Combined node aggregate speed
 				uploadSpeed := float64(rand.Intn(40) + 10)
@@ -102,16 +112,42 @@ func (h *WSHandler) ServeWS(c *gin.Context) {
 				}
 
 				msg = gin.H{
-					"type":          "telemetry",
-					"cpu":           cpu,
-					"memory":        memory,
-					"disk":          disk,
-					"connsCount":    conns,
-					"uploadSpeed":   uploadSpeed,
-					"downloadSpeed": downloadSpeed,
-					"totalDownload": totalDownload,
-					"totalUpload":   totalUpload,
-					"clients":       clients,
+					"type":                  "telemetry",
+					"cpu":                   cpu,
+					"memory":                memory,
+					"disk":                  disk,
+					"connsCount":            len(clients),
+					"uploadSpeed":           uploadSpeed,
+					"downloadSpeed":         downloadSpeed,
+					"totalDownload":         totalDownload,
+					"totalUpload":           totalUpload,
+					"clients":               clients,
+					"cpu_cores_percent":     sysStats.CPUCoresPercent,
+					"cpu_mhz":               sysStats.CPUMhz,
+					"mem_total_gb":          sysStats.MemTotalGB,
+					"mem_used_gb":           sysStats.MemUsedGB,
+					"mem_free_gb":           sysStats.MemFreeGB,
+					"swap_total_gb":         sysStats.SwapTotalGB,
+					"swap_used_gb":          sysStats.SwapUsedGB,
+					"swap_percent":          sysStats.SwapPercent,
+					"disk_total_gb":         sysStats.DiskTotalGB,
+					"disk_used_gb":          sysStats.DiskUsedGB,
+					"disk_free_gb":          sysStats.DiskFreeGB,
+					"disk_read_bytes_sec":   sysStats.DiskReadBytesSec,
+					"disk_write_bytes_sec":  sysStats.DiskWriteBytesSec,
+					"net_recv_bytes_sec":    sysStats.NetRecvBytesSec,
+					"net_sent_bytes_sec":    sysStats.NetSentBytesSec,
+					"cpu_temp":              sysStats.CPUTemp,
+					"uptime_seconds":        sysStats.UptimeSeconds,
+					"boot_time":             sysStats.BootTime,
+					"os_platform":           sysStats.OSPlatform,
+					"os_kernel":             sysStats.OSKernel,
+					"app_mem_mb":            sysStats.AppMemMB,
+					"go_version":            runtime.Version(),
+					"os_runtime":            runtime.GOOS,
+					"active_leeches":        activeLeechCount,
+					"active_torrents":       activeTorrentCount,
+					"active_scheds":         activeSchedulerCount,
 				}
 			}
 

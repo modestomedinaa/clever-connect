@@ -28,6 +28,8 @@ interface LeechConfig {
 	threads_per_job: number;
 	user_agent: string;
 	proxy_url: string;
+	premium_user_id?: string;
+	premium_api_key?: string;
 }
 
 const GameProgressBar: React.FC<{ progress: number; status: string }> = ({ progress, status }) => {
@@ -189,6 +191,7 @@ export const LeechPage: React.FC = () => {
 	const [threads, setThreads] = useState(8);
 	const [downloadUsername, setDownloadUsername] = useState('');
 	const [downloadPassword, setDownloadPassword] = useState('');
+	const [usePremium, setUsePremium] = useState(false);
 
 	// Directory Picker State
 	const [currentPath, setCurrentPath] = useState('/');
@@ -304,7 +307,8 @@ export const LeechPage: React.FC = () => {
 					filename: filename,
 					threads: threads,
 					username: downloadUsername,
-					password: downloadPassword
+					password: downloadPassword,
+					use_premium: usePremium
 				})
 			});
 			if (res.ok) {
@@ -313,6 +317,7 @@ export const LeechPage: React.FC = () => {
 				setFilename('');
 				setDownloadUsername('');
 				setDownloadPassword('');
+				setUsePremium(false);
 			}
 		} catch (err) {
 			console.error(err);
@@ -625,6 +630,7 @@ export const LeechPage: React.FC = () => {
 									<input 
 										type="text" 
 										placeholder="username" 
+										autoComplete="new-password"
 										value={downloadUsername} 
 										onChange={(e) => setDownloadUsername(e.target.value)}
 										style={{ width: '100%', padding: '10px 14px', borderRadius: 8, border: '1px solid var(--color-brand-border)', background: 'var(--color-brand-bg)', outline: 'none', color: 'var(--color-brand-heading)' }}
@@ -635,6 +641,7 @@ export const LeechPage: React.FC = () => {
 									<input 
 										type="password" 
 										placeholder="password" 
+										autoComplete="new-password"
 										value={downloadPassword} 
 										onChange={(e) => setDownloadPassword(e.target.value)}
 										style={{ width: '100%', padding: '10px 14px', borderRadius: 8, border: '1px solid var(--color-brand-border)', background: 'var(--color-brand-bg)', outline: 'none', color: 'var(--color-brand-heading)' }}
@@ -679,6 +686,50 @@ export const LeechPage: React.FC = () => {
 									onChange={(e) => setThreads(parseInt(e.target.value))}
 									style={{ width: '100%', accentColor: 'var(--color-brand)' }}
 								/>
+							</div>
+							<div 
+								style={{ 
+									display: 'flex', 
+									alignItems: 'center', 
+									justifyContent: 'space-between', 
+									padding: '12px 16px', 
+									borderRadius: 8, 
+									border: usePremium ? '1px solid rgba(234, 88, 12, 0.4)' : '1px solid var(--color-brand-border)', 
+									background: usePremium ? 'rgba(234, 88, 12, 0.05)' : 'var(--color-brand-bg)',
+									cursor: 'pointer',
+									transition: 'all 0.2s ease',
+									marginTop: 4
+								}}
+								onClick={() => setUsePremium(!usePremium)}
+							>
+								<div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+									<span style={{ fontSize: 13, fontWeight: 700, color: usePremium ? 'var(--color-brand)' : 'var(--color-brand-heading)' }}>
+										Premium.to Link Leech
+									</span>
+									<span style={{ fontSize: 10, color: 'var(--color-brand-muted)' }}>
+										Resolve host links (Rapidgator, etc.) via premium.to account
+									</span>
+								</div>
+								
+								<div style={{
+									width: 40,
+									height: 20,
+									borderRadius: 20,
+									background: usePremium ? 'var(--color-brand)' : '#334155',
+									position: 'relative',
+									transition: 'background 0.2s'
+								}}>
+									<div style={{
+										width: 14,
+										height: 14,
+										borderRadius: '50%',
+										background: '#fff',
+										position: 'absolute',
+										top: 3,
+										left: usePremium ? 23 : 3,
+										transition: 'left 0.2s cubic-bezier(0.4, 0, 0.2, 1)'
+									}} />
+								</div>
 							</div>
 						</div>
 
@@ -857,6 +908,29 @@ export const LeechPage: React.FC = () => {
 									onChange={(e) => setConfig({ ...config, proxy_url: e.target.value })}
 									style={{ width: '100%', padding: '10px 14px', borderRadius: 8, border: '1px solid var(--color-brand-border)', background: 'var(--color-brand-bg)', outline: 'none', color: 'var(--color-brand-heading)' }}
 								/>
+							</div>
+
+							<div style={{ display: 'flex', gap: 12 }}>
+								<div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
+									<label style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-brand-muted)' }}>Premium.to User ID</label>
+									<input 
+										type="text" 
+										placeholder="e.g. GE4DGMJV"
+										value={config.premium_user_id || ''} 
+										onChange={(e) => setConfig({ ...config, premium_user_id: e.target.value })}
+										style={{ width: '100%', padding: '10px 14px', borderRadius: 8, border: '1px solid var(--color-brand-border)', background: 'var(--color-brand-bg)', outline: 'none', color: 'var(--color-brand-heading)' }}
+									/>
+								</div>
+								<div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
+									<label style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-brand-muted)' }}>Premium.to API Key</label>
+									<input 
+										type="password" 
+										placeholder="e.g. 9D0CEWH..."
+										value={config.premium_api_key || ''} 
+										onChange={(e) => setConfig({ ...config, premium_api_key: e.target.value })}
+										style={{ width: '100%', padding: '10px 14px', borderRadius: 8, border: '1px solid var(--color-brand-border)', background: 'var(--color-brand-bg)', outline: 'none', color: 'var(--color-brand-heading)' }}
+									/>
+								</div>
 							</div>
 						</div>
 
