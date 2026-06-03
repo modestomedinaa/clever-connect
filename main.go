@@ -191,6 +191,9 @@ func main() {
 			protected.POST("/telegram/send-file", telegramHandler.SendFile)
 			protected.POST("/telegram/set-avatar", telegramHandler.SetBotAvatar)
 			protected.POST("/telegram/broadcast", telegramHandler.BroadcastMessage)
+			protected.POST("/telegram/auth/send-code", telegramHandler.SendAuthCode)
+			protected.POST("/telegram/auth/verify-code", telegramHandler.VerifyAuthCode)
+			protected.POST("/telegram/auth/verify-password", telegramHandler.VerifyAuthPassword)
 			protected.POST("/settings/favicon", handlers.UploadFavicon)
 
 			// Enterprise Job Scheduler API Endpoints

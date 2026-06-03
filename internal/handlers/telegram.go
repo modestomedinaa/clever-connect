@@ -214,9 +214,23 @@ func (h *TelegramHandler) TestConnection(c *gin.Context) {
 	}
 
 	var req struct {
-		BotToken string `json:"bot_token" binding:"required"`
+		BotToken string `json:"bot_token"`
+		AuthType string `json:"auth_type"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload"})
+		return
+	}
+
+	if req.AuthType == "user" {
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "User account verification must be completed using phone number and code.",
+		})
+		return
+	}
+
+	if req.BotToken == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Bot token is required"})
 		return
 	}
@@ -264,21 +278,26 @@ func (h *TelegramHandler) StartBot(c *gin.Context) {
 	}
 
 	var cfg models.TelegramConfig
-	if err := db.DB.First(&cfg).Error; err != nil || cfg.BotToken == "" {
+	if err := db.DB.First(&cfg).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No Telegram configuration found. Save a configuration first."})
+		return
+	}
+
+	if cfg.AuthType == "bot" && cfg.BotToken == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No bot token configured. Save a configuration first."})
 		return
 	}
 
 	if err := telegram.StartEngine(&cfg); err != nil {
 		logger.Error("Telegram", "Failed to start bot engine", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start bot: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start: " + err.Error()})
 		return
 	}
 
 	db.DB.Model(&cfg).Update("is_active", true)
 
-	logger.Info("Telegram", "Bot started via API", "ip", c.ClientIP())
-	c.JSON(http.StatusOK, gin.H{"status": "success", "message": "Telegram bot started"})
+	logger.Info("Telegram", "Engine started via API", "ip", c.ClientIP())
+	c.JSON(http.StatusOK, gin.H{"status": "success", "message": "Telegram engine started"})
 }
 
 // StopBot stops the running Telegram bot engine.
@@ -497,4 +516,136 @@ func (h *TelegramHandler) BroadcastMessage(c *gin.Context) {
 		"message":           fmt.Sprintf("Broadcast initiated successfully to %d active subscribers", len(subs)),
 		"subscribers_count": len(subs),
 	})
+}
+
+// SendAuthCode initiates the user login flow by sending a verification code.
+// POST /api/telegram/auth/send-code
+func (h *TelegramHandler) SendAuthCode(c *gin.Context) {
+	if h.proxyToServer(c) {
+		return
+	}
+
+	var req struct {
+		PhoneNumber string `json:"phone_number" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "phone_number is required"})
+		return
+	}
+
+	if telegram.IsRunning() {
+		_ = telegram.StopEngine()
+	}
+
+	var cfg models.TelegramConfig
+	if err := db.DB.First(&cfg).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Save Telegram configuration first before login."})
+		return
+	}
+
+	telegram.InitAuthFlow()
+	telegram.StartAuthClient(req.PhoneNumber, &cfg)
+
+	// Wait for code sent confirmation or immediate error
+	select {
+	case <-telegram.GetCodeSentChan():
+		c.JSON(http.StatusOK, gin.H{
+			"status":  "success",
+			"message": "Verification code sent to " + req.PhoneNumber,
+		})
+	case err := <-telegram.GetErrChan():
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	case <-time.After(15 * time.Second):
+		c.JSON(http.StatusRequestTimeout, gin.H{"error": "Timeout waiting for Telegram to send code. Verify your App api_id and api_hash."})
+	}
+}
+
+// VerifyAuthCode submits the verification code received on SMS/Telegram.
+// POST /api/telegram/auth/verify-code
+func (h *TelegramHandler) VerifyAuthCode(c *gin.Context) {
+	if h.proxyToServer(c) {
+		return
+	}
+
+	var req struct {
+		Code string `json:"code" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "code is required"})
+		return
+	}
+
+	select {
+	case telegram.GetCodeChan() <- req.Code:
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No active authentication flow"})
+		return
+	}
+
+	select {
+	case <-telegram.GetSuccessChan():
+		var cfg models.TelegramConfig
+		_ = db.DB.First(&cfg)
+		cfg.IsActive = true
+		db.DB.Save(&cfg)
+
+		_ = telegram.StartEngine(&cfg)
+
+		c.JSON(http.StatusOK, gin.H{
+			"status":  "success",
+			"message": "Authenticated successfully. User engine started.",
+		})
+	case <-telegram.GetPwReqChan():
+		c.JSON(http.StatusOK, gin.H{
+			"status":            "2fa_required",
+			"password_required": true,
+			"message":           "Two-factor authentication is enabled. Please enter your password.",
+		})
+	case err := <-telegram.GetErrChan():
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	case <-time.After(20 * time.Second):
+		c.JSON(http.StatusRequestTimeout, gin.H{"error": "Timeout waiting for code verification"})
+	}
+}
+
+// VerifyAuthPassword submits the 2FA password.
+// POST /api/telegram/auth/verify-password
+func (h *TelegramHandler) VerifyAuthPassword(c *gin.Context) {
+	if h.proxyToServer(c) {
+		return
+	}
+
+	var req struct {
+		Password string `json:"password" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "password is required"})
+		return
+	}
+
+	select {
+	case telegram.GetPasswordChan() <- req.Password:
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No active authentication flow"})
+		return
+	}
+
+	select {
+	case <-telegram.GetSuccessChan():
+		var cfg models.TelegramConfig
+		_ = db.DB.First(&cfg)
+		cfg.IsActive = true
+		db.DB.Save(&cfg)
+
+		_ = telegram.StartEngine(&cfg)
+
+		c.JSON(http.StatusOK, gin.H{
+			"status":  "success",
+			"message": "Authenticated successfully. User engine started.",
+		})
+	case err := <-telegram.GetErrChan():
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	case <-time.After(20 * time.Second):
+		c.JSON(http.StatusRequestTimeout, gin.H{"error": "Timeout waiting for password verification"})
+	}
 }

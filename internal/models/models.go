@@ -125,6 +125,12 @@ type TelegramConfig struct {
 	EnableFileSharing   bool   `json:"enable_file_sharing" gorm:"default:true"`
 	EnableNotifications bool   `json:"enable_notifications" gorm:"default:true"`
 	IsActive            bool   `json:"is_active" gorm:"default:false"`                  // Whether the bot should auto-start
+	AppID               int    `json:"app_id"`
+	AppHash             string `json:"app_hash"`
+	MTProtoServer       string `json:"mtproto_server"`
+	MTProtoPublicKey    string `json:"mtproto_public_key" gorm:"type:text"`
+	PhoneNumber         string `json:"phone_number"`
+	AuthType            string `json:"auth_type" gorm:"default:'bot'"` // 'bot' or 'user'
 }
 
 // TorrentConfig stores advanced client configurations for BitTorrent client

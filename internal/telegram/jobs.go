@@ -17,7 +17,9 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/telegram/message"
+	"github.com/gotd/td/telegram/message/html"
 	"github.com/gotd/td/telegram/message/styling"
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
@@ -45,6 +47,11 @@ type uploadProgress struct {
 	lastUpdate  time.Time
 	threads     int
 	logFn       func(level, message string)
+
+	// gotd message update support
+	gotdClient *telegram.Client
+	gotdPeer   tg.InputPeerClass
+	gotdMsgID  int
 }
 
 // Chunk satisfies the uploader.Progress interface.
@@ -61,7 +68,7 @@ func (p *uploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 	})
 
 	// Throttle Telegram status message updates (max once per 1.5 seconds) to avoid rate limits
-	if time.Since(p.lastUpdate) > 1500*time.Millisecond && p.progressMsg != nil && p.eng.Bot != nil {
+	if time.Since(p.lastUpdate) > 1500*time.Millisecond {
 		p.lastUpdate = time.Now()
 		
 		elapsed := time.Since(p.startTime).Seconds()
@@ -87,7 +94,17 @@ func (p *uploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 			pBar,
 		)
 
-		_, _ = p.eng.Bot.Edit(p.progressMsg, progressText, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		if p.progressMsg != nil && p.eng.Bot != nil {
+			_, _ = p.eng.Bot.Edit(p.progressMsg, progressText, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		} else if p.gotdClient != nil && p.gotdPeer != nil && p.gotdMsgID != 0 {
+			api := tg.NewClient(p.gotdClient)
+			htmlText := mdToHTML(progressText)
+			_, _ = api.MessagesEditMessage(ctx, &tg.MessagesEditMessageRequest{
+				Peer:    p.gotdPeer,
+				ID:      p.gotdMsgID,
+				Message: htmlText,
+			})
+		}
 	}
 	return nil
 }
@@ -125,7 +142,7 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 	cfg := eng.Config
 	eng.mu.RUnlock()
 
-	if cfg.BotToken == "" {
+	if cfg.AuthType == "bot" && cfg.BotToken == "" {
 		return fmt.Errorf("telegram bot token is empty or unconfigured")
 	}
 
@@ -169,28 +186,80 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 	_ = os.MkdirAll(sessionDir, 0755)
 	sessionPath := filepath.Join(sessionDir, "session.json")
 
-	// Start gotd client to execute the parallel upload via MTProto
-	client := telegram.NewClient(PublicAppID, PublicAppHash, telegram.Options{
+	appID := cfg.AppID
+	if appID == 0 {
+		appID = PublicAppID
+	}
+	appHash := cfg.AppHash
+	if appHash == "" {
+		appHash = PublicAppHash
+	}
+
+	opts := telegram.Options{
 		SessionStorage: &telegram.FileSessionStorage{
 			Path: sessionPath,
 		},
-	})
+	}
+	if cfg.MTProtoServer != "" {
+		if strings.Contains(cfg.MTProtoServer, "149.154.167.40") || strings.Contains(strings.ToLower(cfg.MTProtoServer), "test") {
+			opts.DCList = dcs.Test()
+		}
+	}
+
+	// Start gotd client to execute the parallel upload via MTProto
+	client := telegram.NewClient(appID, appHash, opts)
 
 	var mediaSentErr error
+	var pPeer tg.InputPeerClass
+	var pMsgID int
 
 	runErr := client.Run(ctx, func(ctx context.Context) error {
 		api := tg.NewClient(client)
 
-		// Auth bot token on MTProto
+		// Auth status
 		status, err := client.Auth().Status(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to get auth status: %w", err)
 		}
 
 		if !status.Authorized {
+			if cfg.AuthType == "user" {
+				return fmt.Errorf("user account session is not authenticated")
+			}
 			logFn("INFO", "Authenticating bot with MTProto servers...")
 			if _, err := client.Auth().Bot(ctx, cfg.BotToken); err != nil {
 				return fmt.Errorf("bot authentication failed: %w", err)
+			}
+		}
+
+		peer, err := resolveInputPeer(ctx, api, chatID)
+		if err != nil {
+			return fmt.Errorf("failed to resolve peer for chat ID: %w", err)
+		}
+		pPeer = peer
+
+		if eng.Bot == nil {
+			// User mode: send initial progress message via MTProto client
+			pBar := makeProgressBar(0, 20)
+			initialText := fmt.Sprintf("📤 *Starting Parallel Upload*\n\n📄 *File:* `%s`\n📏 *Size:* %s\n\n%s `0%%`",
+				fileName, formatFileSize(info.Size()), pBar)
+			
+			sender := message.NewSender(api)
+			htmlText := mdToHTML(initialText)
+			msg, err := sender.To(peer).StyledText(ctx, html.String(nil, htmlText))
+			if err == nil {
+				if upd, ok := msg.(*tg.UpdateShortSentMessage); ok {
+					pMsgID = upd.ID
+				} else if updates, ok := msg.(*tg.Updates); ok {
+					for _, u := range updates.Updates {
+						if newMessage, ok := u.(*tg.UpdateNewMessage); ok {
+							pMsgID = newMessage.Message.GetID()
+							break
+						}
+					}
+				}
+			} else {
+				logFn("WARN", fmt.Sprintf("Failed to send initial progress message to Telegram (MTProto): %v", err))
 			}
 		}
 
@@ -207,6 +276,9 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 			lastUpdate:  time.Now(),
 			threads:     threads,
 			logFn:       logFn,
+			gotdClient:  client,
+			gotdPeer:    peer,
+			gotdMsgID:   pMsgID,
 		}
 
 		up := uploader.NewUploader(api).WithThreads(threads).WithProgress(progressTracker)
@@ -215,12 +287,6 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 		inputFile, err := up.FromPath(ctx, safePath)
 		if err != nil {
 			return fmt.Errorf("file upload failed: %w", err)
-		}
-
-		logFn("INFO", "Resolving target chat peer...")
-		peer, err := resolveInputPeer(ctx, api, chatID)
-		if err != nil {
-			return fmt.Errorf("failed to resolve peer for chat ID: %w", err)
 		}
 
 		// Generate a JWT download token for the direct download button
@@ -316,6 +382,11 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 		logFn("INFO", "Media post sent successfully. Cleaning up progress message...")
 		if progressMsg != nil && eng.Bot != nil {
 			_ = eng.Bot.Delete(progressMsg)
+		} else if pMsgID != 0 {
+			_, _ = api.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{
+				ID:     []int{pMsgID},
+				Revoke: true,
+			})
 		}
 
 		return nil
@@ -325,6 +396,13 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 		// Attempt to update the progress message with error
 		if progressMsg != nil && eng.Bot != nil {
 			_, _ = eng.Bot.Edit(progressMsg, fmt.Sprintf("❌ *Parallel Upload Failed*\n\nReason: %s", runErr.Error()), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		} else if pMsgID != 0 && eng.gotdClient != nil && pPeer != nil {
+			api := tg.NewClient(eng.gotdClient)
+			_, _ = api.MessagesEditMessage(ctx, &tg.MessagesEditMessageRequest{
+				Peer:    pPeer,
+				ID:      pMsgID,
+				Message: fmt.Sprintf("❌ <b>Parallel Upload Failed</b>\n\nReason: %s", runErr.Error()),
+			})
 		}
 		return runErr
 	}

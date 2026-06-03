@@ -6,7 +6,10 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -17,6 +20,11 @@ import (
 	"clever-connect/internal/logger"
 	"clever-connect/internal/models"
 
+	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/dcs"
+	"github.com/gotd/td/telegram/updates"
+	updhook "github.com/gotd/td/telegram/updates/hook"
+	"github.com/gotd/td/tg"
 	tele "gopkg.in/telebot.v4"
 )
 
@@ -27,15 +35,21 @@ import (
 
 // Engine holds the running telebot instance and worker pool.
 type Engine struct {
-	Bot        *tele.Bot
-	Config     *models.TelegramConfig
-	workerPool chan func()
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	running    atomic.Bool
-	startedAt  time.Time
-	mu         sync.RWMutex
+	Bot         *tele.Bot        // nil if AuthType == "user"
+	gotdClient  *telegram.Client // nil if AuthType == "bot"
+	gotdCtx     context.Context
+	gotdCancel  context.CancelFunc
+	meUsername  string
+	meID        int64
+	meFirstName string
+	Config      *models.TelegramConfig
+	workerPool  chan func()
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	running     atomic.Bool
+	startedAt   time.Time
+	mu          sync.RWMutex
 
 	// Metrics (atomic for lock-free reads from API)
 	messagesProcessed atomic.Int64
@@ -49,6 +63,22 @@ var (
 	instance *Engine
 	mu       sync.Mutex
 )
+
+type AuthRequest struct {
+	Type          string // "send_code", "sign_in", "password"
+	PhoneNumber   string
+	Code          string
+	Password      string
+	PhoneCodeHash string
+	ResponseChan  chan AuthResponse
+}
+
+type AuthResponse struct {
+	Success          bool
+	Error            string
+	PhoneCodeHash    string
+	PasswordRequired bool
+}
 
 // GetEngine returns the active engine instance, or nil.
 func GetEngine() *Engine {
@@ -74,34 +104,168 @@ func StartEngine(cfg *models.TelegramConfig) error {
 		instance.shutdown()
 	}
 
-	if cfg.BotToken == "" {
-		return fmt.Errorf("telegram bot token is empty")
-	}
-
 	logger.Info("Telegram", "Initializing Telegram bot engine",
+		"auth_type", cfg.AuthType,
 		"workers", runtime.NumCPU(),
 		"polling_interval", cfg.PollingInterval,
 	)
 
-	pref := tele.Settings{
-		Token:  cfg.BotToken,
-		Poller: &tele.LongPoller{Timeout: time.Duration(cfg.PollingInterval) * time.Second},
-	}
-
-	bot, err := tele.NewBot(pref)
-	if err != nil {
-		return fmt.Errorf("failed to create telebot: %w", err)
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 
 	eng := &Engine{
-		Bot:        bot,
 		Config:     cfg,
 		workerPool: make(chan func(), runtime.NumCPU()*64), // buffered job queue
 		ctx:        ctx,
 		cancel:     cancel,
 		startedAt:  time.Now(),
+	}
+
+	if cfg.AuthType == "user" {
+		// Initialize gotd client for User Account
+		appID := cfg.AppID
+		if appID == 0 {
+			appID = 2040
+		}
+		appHash := cfg.AppHash
+		if appHash == "" {
+			appHash = "b18441a1ff607e10a989891a5624e0d4"
+		}
+
+		sessionDir := filepath.Join("./data/manager", ".telegram")
+		_ = os.MkdirAll(sessionDir, 0755)
+		sessionPath := filepath.Join(sessionDir, "session.json")
+
+		// Check if session file exists
+		if _, err := os.Stat(sessionPath); os.IsNotExist(err) {
+			cancel()
+			return fmt.Errorf("user session file does not exist. Please authenticate first via admin panel")
+		}
+
+		d := tg.NewUpdateDispatcher()
+		gaps := updates.New(updates.Config{
+			Handler: d,
+		})
+
+		opts := telegram.Options{
+			SessionStorage: &telegram.FileSessionStorage{
+				Path: sessionPath,
+			},
+			UpdateHandler: gaps,
+			Middlewares: []telegram.Middleware{
+				updhook.UpdateHook(gaps.Handle),
+			},
+		}
+
+		if cfg.MTProtoServer != "" {
+			if strings.Contains(cfg.MTProtoServer, "149.154.167.40") || strings.Contains(strings.ToLower(cfg.MTProtoServer), "test") {
+				opts.DCList = dcs.Test()
+			}
+		}
+
+		client := telegram.NewClient(appID, appHash, opts)
+		eng.gotdClient = client
+		eng.gotdCtx = ctx
+		eng.gotdCancel = cancel
+
+		// Register gotd commands and updates
+		d.OnNewMessage(func(ctx context.Context, entities tg.Entities, u *tg.UpdateNewMessage) error {
+			eng.Dispatch(func() {
+				if err := eng.handleUserMessage(ctx, entities, u); err != nil {
+					logger.Error("Telegram", "Failed to handle user message", "error", err)
+				}
+			})
+			return nil
+		})
+
+		d.OnBotCallbackQuery(func(ctx context.Context, entities tg.Entities, u *tg.UpdateBotCallbackQuery) error {
+			eng.Dispatch(func() {
+				if err := eng.handleUserCallbackQuery(ctx, entities, u); err != nil {
+					logger.Error("Telegram", "Failed to handle user callback query", "error", err)
+				}
+			})
+			return nil
+		})
+
+		// Start gotd client
+		eng.running.Store(true)
+		errChan := make(chan error, 1)
+		go func() {
+			err := client.Run(ctx, func(ctx context.Context) error {
+				self, err := client.Self(ctx)
+				if err != nil {
+					return err
+				}
+				eng.mu.Lock()
+				eng.meUsername = self.Username
+				eng.meID = self.ID
+				eng.meFirstName = self.FirstName
+				eng.mu.Unlock()
+
+				logger.Info("Telegram", "User account engine running",
+					"username", self.Username,
+					"id", self.ID,
+				)
+
+				// Signal success
+				errChan <- nil
+
+				<-ctx.Done()
+				return nil
+			})
+			if err != nil && !errors.Is(err, context.Canceled) {
+				logger.Error("Telegram", "MTProto client run failed", "error", err)
+				eng.running.Store(false)
+				select {
+				case errChan <- err:
+				default:
+				}
+			}
+		}()
+
+		// Wait for start confirmation or error
+		select {
+		case err := <-errChan:
+			if err != nil {
+				cancel()
+				return err
+			}
+		case <-time.After(10 * time.Second):
+			cancel()
+			return fmt.Errorf("timeout waiting for MTProto client to start")
+		}
+
+	} else {
+		// Bot Token mode (original telebot)
+		if cfg.BotToken == "" {
+			cancel()
+			return fmt.Errorf("telegram bot token is empty")
+		}
+
+		pref := tele.Settings{
+			Token:  cfg.BotToken,
+			Poller: &tele.LongPoller{Timeout: time.Duration(cfg.PollingInterval) * time.Second},
+		}
+
+		bot, err := tele.NewBot(pref)
+		if err != nil {
+			cancel()
+			return fmt.Errorf("failed to create telebot: %w", err)
+		}
+
+		eng.Bot = bot
+		eng.meUsername = bot.Me.Username
+		eng.meID = bot.Me.ID
+		eng.meFirstName = bot.Me.FirstName
+
+		// Register telebot handlers and middleware
+		eng.registerMiddleware()
+		eng.registerCommands()
+
+		eng.running.Store(true)
+		go func() {
+			logger.Info("Telegram", "Bot polling started", "username", bot.Me.Username)
+			bot.Start()
+		}()
 	}
 
 	// Spin up worker goroutines — one per CPU core
@@ -111,22 +275,11 @@ func StartEngine(cfg *models.TelegramConfig) error {
 		go eng.worker(i)
 	}
 
-	// Register all command handlers and middleware
-	eng.registerMiddleware()
-	eng.registerCommands()
-
-	// Start the bot polling loop in a dedicated goroutine
-	eng.running.Store(true)
-	go func() {
-		logger.Info("Telegram", "Bot polling started", "username", bot.Me.Username)
-		bot.Start()
-	}()
-
 	instance = eng
 
-	logger.Info("Telegram", "Telegram bot engine started successfully",
-		"bot_username", bot.Me.Username,
-		"bot_id", bot.Me.ID,
+	logger.Info("Telegram", "Telegram engine started successfully",
+		"username", eng.meUsername,
+		"id", eng.meID,
 		"workers", numWorkers,
 	)
 
@@ -152,7 +305,12 @@ func StopEngine() error {
 func (e *Engine) shutdown() {
 	e.running.Store(false)
 	e.cancel()
-	e.Bot.Stop()
+	if e.Bot != nil {
+		e.Bot.Stop()
+	}
+	if e.gotdCancel != nil {
+		e.gotdCancel()
+	}
 	close(e.workerPool)
 	e.wg.Wait()
 }
@@ -223,6 +381,11 @@ func (e *Engine) ReloadConfig() error {
 
 // Stats returns engine runtime metrics.
 func (e *Engine) Stats() map[string]interface{} {
+	e.mu.RLock()
+	meUsername := e.meUsername
+	meID := e.meID
+	e.mu.RUnlock()
+
 	return map[string]interface{}{
 		"running":             e.running.Load(),
 		"uptime_seconds":      int(time.Since(e.startedAt).Seconds()),
@@ -231,8 +394,8 @@ func (e *Engine) Stats() map[string]interface{} {
 		"commands_processed":  e.commandsProcessed.Load(),
 		"files_sent":          e.filesSent.Load(),
 		"errors":              e.errors.Load(),
-		"bot_username":        e.Bot.Me.Username,
-		"bot_id":              e.Bot.Me.ID,
+		"bot_username":        meUsername,
+		"bot_id":              meID,
 	}
 }
 
