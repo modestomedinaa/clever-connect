@@ -79,18 +79,16 @@ func (p *uploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 
 		pBar := makeProgressBar(percent, 20)
 		progressText := fmt.Sprintf(
-			"📤 *Uploading (Multi-Connection)*\n\n"+
+			"📤 *Uploading File*\n\n"+
 				"📄 *File:* `%s`\n"+
 				"📏 *Uploaded:* %s of %s (%d%%)\n"+
-				"⚡ *Speed:* %.2f MB/s\n"+
-				"🧵 *Connections:* %d\n\n"+
+				"⚡ *Speed:* %.2f MB/s\n\n"+
 				"%s",
 			p.fileName,
 			formatFileSize(state.Uploaded),
 			formatFileSize(state.Total),
 			percent,
 			speed,
-			p.threads,
 			pBar,
 		)
 
@@ -111,7 +109,7 @@ func (p *uploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 
 // RunTelegramUploadJob executes a parallel multi-connection file upload to Telegram.
 func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn func(level, message string)) error {
-	logFn("INFO", "Telegram parallel upload job started")
+	logFn("INFO", "Telegram upload job started")
 
 	var payload TelegramUploadPayload
 	if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
@@ -164,13 +162,13 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 	}
 
 	fileName := filepath.Base(safePath)
-	logFn("INFO", fmt.Sprintf("Preparing parallel upload of %s (size %s) to chat %d", fileName, formatFileSize(info.Size()), chatID))
+	logFn("INFO", fmt.Sprintf("Preparing upload of %s (size %s) to chat %d", fileName, formatFileSize(info.Size()), chatID))
 
 	// Send initial progress text message via the active telebot instance
 	var progressMsg *tele.Message
 	if eng.Bot != nil {
 		pBar := makeProgressBar(0, 20)
-		initialText := fmt.Sprintf("📤 *Starting Parallel Upload*\n\n📄 *File:* `%s`\n📏 *Size:* %s\n\n%s `0%%`",
+		initialText := fmt.Sprintf("📤 *Starting Upload*\n\n📄 *File:* `%s`\n📏 *Size:* %s\n\n%s `0%%`",
 			fileName, formatFileSize(info.Size()), pBar)
 		
 		msg, err := eng.Bot.Send(tele.ChatID(chatID), initialText, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
@@ -241,7 +239,7 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 		if eng.Bot == nil {
 			// User mode: send initial progress message via MTProto client
 			pBar := makeProgressBar(0, 20)
-			initialText := fmt.Sprintf("📤 *Starting Parallel Upload*\n\n📄 *File:* `%s`\n📏 *Size:* %s\n\n%s `0%%`",
+			initialText := fmt.Sprintf("📤 *Starting Upload*\n\n📄 *File:* `%s`\n📏 *Size:* %s\n\n%s `0%%`",
 				fileName, formatFileSize(info.Size()), pBar)
 			
 			sender := message.NewSender(api)
@@ -263,8 +261,8 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 			}
 		}
 
-		// Initialize uploader with 4 threads for parallel multi-connection chunk uploading
-		threads := 4
+		// Initialize uploader with 1 thread for stable single-connection uploading
+		threads := 1
 		
 		// Initialize uploader progress tracker
 		progressTracker := &uploadProgress{

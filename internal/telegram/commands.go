@@ -571,7 +571,7 @@ func (e *Engine) sendFileToChatUser(ctx context.Context, entities tg.Entities, p
 		if QueueUploadJob != nil {
 			err := QueueUploadJob(filePath, chatID)
 			if err != nil {
-				return e.sendUserMessage(ctx, entities, peer, "❌ Failed to queue parallel upload: "+err.Error())
+				return e.sendUserMessage(ctx, entities, peer, "❌ Failed to queue background upload: "+err.Error())
 			}
 			return nil
 		}
