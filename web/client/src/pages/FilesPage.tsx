@@ -307,12 +307,23 @@ const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({ src, title, onClo
 		return () => window.removeEventListener('keydown', handleKeyDown);
 	}, [isPlaying, isMuted, volume, playbackSpeed, onClose]);
 
-	// Auto-mute sync on mount
+	// Auto-mute sync on mount & clean up on unmount
 	useEffect(() => {
 		if (videoRef.current) {
 			videoRef.current.muted = true;
 			videoRef.current.volume = 0;
 		}
+		return () => {
+			if (videoRef.current) {
+				try {
+					videoRef.current.pause();
+					videoRef.current.src = "";
+					videoRef.current.load();
+				} catch (e) {
+					console.error("Failed to load blank src:", e);
+				}
+			}
+		};
 	}, [src]);
 
 	return (
