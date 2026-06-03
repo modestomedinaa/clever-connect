@@ -7,7 +7,9 @@ import (
 	"mime"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -302,15 +304,123 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 	switch ext {
 	case ".jpg", ".jpeg", ".png", ".gif":
 		mediaOption = message.UploadedPhoto(inputFile, styling.Plain(caption))
-	case ".mp4":
-		doc := message.UploadedDocument(inputFile, styling.Plain(caption))
-		mediaOption = doc.MIME("video/mp4").Filename(fileName).Video().SupportsStreaming()
-	case ".mp3", ".m4a":
-		doc := message.UploadedDocument(inputFile, styling.Plain(caption))
-		mediaOption = doc.MIME(mimeType).Filename(fileName).Audio()
+	case ".mp4", ".mkv", ".webm", ".avi", ".mov":
+		w, h, duration, videoCodec, audioCodec, totalBitrate, title, artist := probeMediaMetadata(safePath)
+
+		durationStr := "Unknown"
+		if duration > 0 {
+			durationStr = formatDuration(duration)
+		}
+
+		resStr := "Unknown"
+		if w > 0 && h > 0 {
+			resStr = formatResolution(w, h)
+		}
+
+		codecStr := "Unknown"
+		if videoCodec != "" || audioCodec != "" {
+			codecStr = formatCodecs(videoCodec, audioCodec)
+		}
+
+		bitrateStr := "Unknown"
+		if totalBitrate > 0 {
+			bitrateStr = formatBitrate(totalBitrate)
+		}
+
+		videoCaption := fmt.Sprintf("🎬 *CleverConnect Premium Share*\n\n"+
+			"📄 *File Name:* `%s`\n"+
+			"📏 *File Size:* `%s`\n"+
+			"🕒 *Duration:* `%s`\n"+
+			"🖥️ *Resolution:* `%s`\n"+
+			"⚙️ *Codecs:* `%s`\n"+
+			"⚡ *Bitrate:* `%s`\n"+
+			"📅 *Uploaded:* `%s`\n\n"+
+			"⚡ _Powered by CleverConnect Job Scheduler_",
+			fileName,
+			formatFileSize(info.Size()),
+			durationStr,
+			resStr,
+			codecStr,
+			bitrateStr,
+			time.Now().Format("2006-01-02 15:04:05"),
+		)
+
+		if title != "" {
+			prefix := fmt.Sprintf("🎵 *Title:* `%s`", title)
+			if artist != "" {
+				prefix += fmt.Sprintf(" - `%s`", artist)
+			}
+			videoCaption = prefix + "\n" + videoCaption
+		}
+
+		doc := message.UploadedDocument(inputFile, styling.Plain(videoCaption))
+		mimeStr := "video/mp4"
+		if ext == ".mkv" {
+			mimeStr = "video/x-matroska"
+		} else if ext == ".webm" {
+			mimeStr = "video/webm"
+		} else if ext == ".mov" {
+			mimeStr = "video/quicktime"
+		} else if ext == ".avi" {
+			mimeStr = "video/x-msvideo"
+		}
+
+		videoBuilder := doc.MIME(mimeStr).Filename(fileName).Video()
+		if w > 0 && h > 0 {
+			videoBuilder = videoBuilder.Resolution(w, h)
+		}
+		if duration > 0 {
+			videoBuilder = videoBuilder.DurationSeconds(duration)
+		}
+		mediaOption = videoBuilder.SupportsStreaming()
+
+	case ".mp3", ".m4a", ".flac", ".wav":
+		_, _, duration, _, _, _, title, artist := probeMediaMetadata(safePath)
+		
+		audioCaption := fmt.Sprintf("🎵 *CleverConnect Audio Share*\n\n"+
+			"📄 *File Name:* `%s`\n"+
+			"📏 *File Size:* `%s`\n"+
+			"🕒 *Duration:* `%s`\n"+
+			"📅 *Uploaded:* `%s`\n\n"+
+			"⚡ _Powered by CleverConnect Job Scheduler_",
+			fileName,
+			formatFileSize(info.Size()),
+			formatDuration(duration),
+			time.Now().Format("2006-01-02 15:04:05"),
+		)
+
+		if title != "" {
+			prefix := fmt.Sprintf("🎵 *Title:* `%s`", title)
+			if artist != "" {
+				prefix += fmt.Sprintf(" - `%s`", artist)
+			}
+			audioCaption = prefix + "\n" + audioCaption
+		}
+
+		doc := message.UploadedDocument(inputFile, styling.Plain(audioCaption))
+		audioBuilder := doc.MIME(mimeType).Filename(fileName).Audio()
+		if duration > 0 {
+			audioBuilder = audioBuilder.DurationSeconds(duration)
+		}
+		if title != "" {
+			audioBuilder = audioBuilder.Title(title)
+		} else {
+			audioBuilder = audioBuilder.Title(strings.TrimSuffix(fileName, filepath.Ext(fileName)))
+		}
+		if artist != "" {
+			audioBuilder = audioBuilder.Performer(artist)
+		}
+		mediaOption = audioBuilder
+
 	case ".ogg", ".opus":
+		_, _, duration, _, _, _, _, _ := probeMediaMetadata(safePath)
 		doc := message.UploadedDocument(inputFile, styling.Plain(caption))
-		mediaOption = doc.MIME(mimeType).Filename(fileName).Audio().Voice()
+		audioBuilder := doc.MIME(mimeType).Filename(fileName).Audio().Voice()
+		if duration > 0 {
+			audioBuilder = audioBuilder.DurationSeconds(duration)
+		}
+		mediaOption = audioBuilder
+
 	default:
 		doc := message.UploadedDocument(inputFile, styling.Plain(caption))
 		doc.MIME(mimeType).Filename(fileName)
@@ -805,4 +915,136 @@ func makeProgressBar(percent int, width int) string {
 	}
 	sb.WriteString("]")
 	return sb.String()
+}
+
+type ffprobeOutput struct {
+	Streams []struct {
+		Width      int    `json:"width"`
+		Height     int    `json:"height"`
+		Duration   string `json:"duration"`
+		CodecType  string `json:"codec_type"`
+		CodecName  string `json:"codec_name"`
+		BitRate    string `json:"bit_rate"`
+	} `json:"streams"`
+	Format struct {
+		Duration string            `json:"duration"`
+		Tags     map[string]string `json:"tags"`
+		BitRate  string            `json:"bit_rate"`
+	} `json:"format"`
+}
+
+func probeMediaMetadata(filePath string) (w, h, duration int, videoCodec, audioCodec string, totalBitrate int64, title, artist string) {
+	cmd := exec.Command("ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", filePath)
+	out, err := cmd.Output()
+	if err != nil {
+		return
+	}
+
+	var data ffprobeOutput
+	if err := json.Unmarshal(out, &data); err != nil {
+		return
+	}
+
+	// 1. Parse Streams
+	for _, stream := range data.Streams {
+		if stream.CodecType == "video" {
+			w = stream.Width
+			h = stream.Height
+			videoCodec = stream.CodecName
+		} else if stream.CodecType == "audio" {
+			audioCodec = stream.CodecName
+		}
+	}
+
+	// 2. Parse Duration
+	var durStr string
+	if data.Format.Duration != "" {
+		durStr = data.Format.Duration
+	} else {
+		for _, stream := range data.Streams {
+			if stream.Duration != "" {
+				durStr = stream.Duration
+				break
+			}
+		}
+	}
+	if durStr != "" {
+		if f, err := strconv.ParseFloat(durStr, 64); err == nil {
+			duration = int(f)
+		}
+	}
+
+	// 3. Parse Bitrate
+	if data.Format.BitRate != "" {
+		if br, err := strconv.ParseInt(data.Format.BitRate, 10, 64); err == nil {
+			totalBitrate = br
+		}
+	}
+
+	// 4. Parse Tags
+	if data.Format.Tags != nil {
+		for k, v := range data.Format.Tags {
+			lk := strings.ToLower(k)
+			if lk == "title" {
+				title = v
+			} else if lk == "artist" || lk == "performer" {
+				artist = v
+			}
+		}
+	}
+
+	return
+}
+
+func formatDuration(sec int) string {
+	h := sec / 3600
+	m := (sec % 3600) / 60
+	s := sec % 60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%d:%02d", m, s)
+}
+
+func formatResolution(w, h int) string {
+	if w == 0 || h == 0 {
+		return "Unknown"
+	}
+	label := "SD"
+	switch {
+	case h >= 2160:
+		label = "4K UHD"
+	case h >= 1440:
+		label = "2K QHD"
+	case h >= 1080:
+		label = "1080p FHD"
+	case h >= 720:
+		label = "720p HD"
+	}
+	return fmt.Sprintf("%dx%d (%s)", w, h, label)
+}
+
+func formatBitrate(bps int64) string {
+	if bps == 0 {
+		return "Unknown"
+	}
+	mbps := float64(bps) / 1000000.0
+	if mbps >= 1.0 {
+		return fmt.Sprintf("%.2f Mbps", mbps)
+	}
+	kbps := float64(bps) / 1000.0
+	return fmt.Sprintf("%.0f Kbps", kbps)
+}
+
+func formatCodecs(vc, ac string) string {
+	if vc == "" && ac == "" {
+		return "Unknown"
+	}
+	if vc == "" {
+		return strings.ToUpper(ac)
+	}
+	if ac == "" {
+		return strings.ToUpper(vc)
+	}
+	return fmt.Sprintf("%s / %s", strings.ToUpper(vc), strings.ToUpper(ac))
 }
