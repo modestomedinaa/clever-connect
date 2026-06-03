@@ -7,17 +7,19 @@ import (
 	"mime"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"clever-connect/internal/config"
 	"clever-connect/internal/db"
+	"clever-connect/internal/filecore"
 	"clever-connect/internal/models"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/telegram/message/html"
 	"github.com/gotd/td/telegram/message/styling"
@@ -77,30 +79,43 @@ func (p *uploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 			speed = float64(state.Uploaded) / elapsed / (1024 * 1024) // MB/s
 		}
 
-		pBar := makeProgressBar(percent, 20)
-		progressText := fmt.Sprintf(
-			"📤 *Uploading File*\n\n"+
-				"📄 *File:* `%s`\n"+
-				"📏 *Uploaded:* %s of %s (%d%%)\n"+
-				"⚡ *Speed:* %.2f MB/s\n\n"+
-				"%s",
-			p.fileName,
-			formatFileSize(state.Uploaded),
-			formatFileSize(state.Total),
-			percent,
-			speed,
-			pBar,
-		)
+		progressText := formatUploadProgressText(p.fileName, state.Uploaded, state.Total, percent, speed, elapsed)
 
 		if p.progressMsg != nil && p.eng.Bot != nil {
-			_, _ = p.eng.Bot.Edit(p.progressMsg, progressText, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+			btnRestart := tele.InlineButton{
+				Text:   "🔄 Restart Job",
+				Unique: "restart_job",
+				Data:   fmt.Sprintf("%d", p.job.ID),
+			}
+			inlineMarkup := &tele.ReplyMarkup{
+				InlineKeyboard: [][]tele.InlineButton{
+					{btnRestart},
+				},
+			}
+			_, _ = p.eng.Bot.Edit(p.progressMsg, progressText, &tele.SendOptions{
+				ParseMode:   tele.ModeMarkdown,
+				ReplyMarkup: inlineMarkup,
+			})
 		} else if p.gotdClient != nil && p.gotdPeer != nil && p.gotdMsgID != 0 {
 			api := tg.NewClient(p.gotdClient)
 			htmlText := mdToHTML(progressText)
+			kbMarkup := &tg.ReplyInlineMarkup{
+				Rows: []tg.KeyboardButtonRow{
+					{
+						Buttons: []tg.KeyboardButtonClass{
+							&tg.KeyboardButtonCallback{
+								Text: "🔄 Restart Job",
+								Data: []byte(fmt.Sprintf("restart_job:%d", p.job.ID)),
+							},
+						},
+					},
+				},
+			}
 			_, _ = api.MessagesEditMessage(ctx, &tg.MessagesEditMessageRequest{
-				Peer:    p.gotdPeer,
-				ID:      p.gotdMsgID,
-				Message: htmlText,
+				Peer:        p.gotdPeer,
+				ID:          p.gotdMsgID,
+				Message:     htmlText,
+				ReplyMarkup: kbMarkup,
 			})
 		}
 	}
@@ -167,11 +182,23 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 	// Send initial progress text message via the active telebot instance
 	var progressMsg *tele.Message
 	if eng.Bot != nil {
-		pBar := makeProgressBar(0, 20)
-		initialText := fmt.Sprintf("📤 *Starting Upload*\n\n📄 *File:* `%s`\n📏 *Size:* %s\n\n%s `0%%`",
-			fileName, formatFileSize(info.Size()), pBar)
+		initialText := formatUploadInitialText(fileName, info.Size())
 		
-		msg, err := eng.Bot.Send(tele.ChatID(chatID), initialText, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		btnRestart := tele.InlineButton{
+			Text:   "🔄 Restart Job",
+			Unique: "restart_job",
+			Data:   fmt.Sprintf("%d", job.ID),
+		}
+		inlineMarkup := &tele.ReplyMarkup{
+			InlineKeyboard: [][]tele.InlineButton{
+				{btnRestart},
+			},
+		}
+
+		msg, err := eng.Bot.Send(tele.ChatID(chatID), initialText, &tele.SendOptions{
+			ParseMode:   tele.ModeMarkdown,
+			ReplyMarkup: inlineMarkup,
+		})
 		if err != nil {
 			logFn("WARN", fmt.Sprintf("Failed to send initial progress message to Telegram: %v", err))
 		} else {
@@ -179,239 +206,308 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 		}
 	}
 
-	sessionDir := filepath.Join(fileManagerRoot, ".telegram")
-	_ = os.MkdirAll(sessionDir, 0755)
-	var sessionPath string
-	if cfg.AuthType == "user" {
-		sessionPath = filepath.Join(sessionDir, "session.json")
-	} else {
-		sessionPath = filepath.Join(sessionDir, "session_bot.json")
+	// Reuse the engine's already-running MTProto client instead of creating a new one.
+	// This eliminates cold auth handshakes and halves connection overhead.
+	if eng.gotdClient == nil {
+		return fmt.Errorf("MTProto client is not initialized — cannot upload via MTProto")
 	}
-
-	appID := cfg.AppID
-	if appID == 0 {
-		appID = PublicAppID
-	}
-	appHash := cfg.AppHash
-	if appHash == "" {
-		appHash = PublicAppHash
-	}
-
-	opts := telegram.Options{
-		SessionStorage: &telegram.FileSessionStorage{
-			Path: sessionPath,
-		},
-	}
-	if cfg.MTProtoServer != "" {
-		if strings.Contains(cfg.MTProtoServer, "149.154.167.40") || strings.Contains(strings.ToLower(cfg.MTProtoServer), "test") {
-			opts.DCList = dcs.Test()
-		}
-	}
-
-	// Start gotd client to execute the parallel upload via MTProto
-	client := telegram.NewClient(appID, appHash, opts)
 
 	var mediaSentErr error
 	var pPeer tg.InputPeerClass
 	var pMsgID int
 
-	runErr := client.Run(ctx, func(ctx context.Context) error {
-		api := tg.NewClient(client)
+	// The engine's gotdClient is already running inside client.Run().
+	// We can use the engine's gotdCtx to execute API calls directly.
+	api := tg.NewClient(eng.gotdClient)
 
-		// Auth status
-		status, err := client.Auth().Status(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to get auth status: %w", err)
-		}
+	peer, err := resolveInputPeer(eng.gotdCtx, api, chatID)
+	if err != nil {
+		return fmt.Errorf("failed to resolve peer for chat ID: %w", err)
+	}
+	pPeer = peer
 
-		if !status.Authorized {
-			if cfg.AuthType == "user" {
-				return fmt.Errorf("user account session is not authenticated")
-			}
-			logFn("INFO", "Authenticating bot with MTProto servers...")
-			if _, err := client.Auth().Bot(ctx, cfg.BotToken); err != nil {
-				return fmt.Errorf("bot authentication failed: %w", err)
-			}
-		}
+	if eng.Bot == nil {
+		// User mode: send initial progress message via MTProto client
+		initialText := formatUploadInitialText(fileName, info.Size())
 
-		peer, err := resolveInputPeer(ctx, api, chatID)
-		if err != nil {
-			return fmt.Errorf("failed to resolve peer for chat ID: %w", err)
-		}
-		pPeer = peer
-
-		if eng.Bot == nil {
-			// User mode: send initial progress message via MTProto client
-			pBar := makeProgressBar(0, 20)
-			initialText := fmt.Sprintf("📤 *Starting Upload*\n\n📄 *File:* `%s`\n📏 *Size:* %s\n\n%s `0%%`",
-				fileName, formatFileSize(info.Size()), pBar)
-			
-			sender := message.NewSender(api)
-			htmlText := mdToHTML(initialText)
-			msg, err := sender.To(peer).StyledText(ctx, html.String(nil, htmlText))
-			if err == nil {
-				if upd, ok := msg.(*tg.UpdateShortSentMessage); ok {
-					pMsgID = upd.ID
-				} else if updates, ok := msg.(*tg.Updates); ok {
-					for _, u := range updates.Updates {
-						if newMessage, ok := u.(*tg.UpdateNewMessage); ok {
-							pMsgID = newMessage.Message.GetID()
-							break
-						}
-					}
-				}
-			} else {
-				logFn("WARN", fmt.Sprintf("Failed to send initial progress message to Telegram (MTProto): %v", err))
-			}
-		}
-
-		// Initialize uploader with 1 thread for stable single-connection uploading
-		threads := 1
-		
-		// Initialize uploader progress tracker
-		progressTracker := &uploadProgress{
-			job:         job,
-			eng:         eng,
-			progressMsg: progressMsg,
-			fileName:    fileName,
-			startTime:   time.Now(),
-			lastUpdate:  time.Now(),
-			threads:     threads,
-			logFn:       logFn,
-			gotdClient:  client,
-			gotdPeer:    peer,
-			gotdMsgID:   pMsgID,
-		}
-
-		up := uploader.NewUploader(api).WithThreads(threads).WithProgress(progressTracker)
-
-		logFn("INFO", "Uploading file to Telegram servers...")
-		inputFile, err := up.FromPath(ctx, safePath)
-		if err != nil {
-			return fmt.Errorf("file upload failed: %w", err)
-		}
-
-		// Generate a JWT download token for the direct download button
-		appCfg := config.LoadConfig()
-		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-			"username": "admin",
-			"role":     "admin",
-			"exp":      time.Now().Add(7 * 24 * time.Hour).Unix(),
-		})
-		tokenString, err := token.SignedString(appCfg.JWTSecret)
-		if err != nil {
-			logFn("WARN", fmt.Sprintf("Failed to sign JWT download token: %v", err))
-		}
-
-		// Construct absolute download link
-		var absoluteDownloadURL string
-		downloadPath := fmt.Sprintf("/api/files/stream?path=%s&download=true", url.QueryEscape(payload.FilePath))
-		if tokenString != "" {
-			downloadPath += fmt.Sprintf("&token=%s", url.QueryEscape(tokenString))
-		}
-
-		// Determine base host from Ehco config
-		var ehcoCfg models.EhcoClientConfig
-		if err := db.DB.First(&ehcoCfg).Error; err == nil && ehcoCfg.RemoteURL != "" {
-			domain := ehcoCfg.RemoteURL
-			domain = strings.Replace(domain, "wss://", "https://", 1)
-			domain = strings.Replace(domain, "ws://", "http://", 1)
-			domain = strings.TrimSuffix(domain, "/ws")
-			domain = strings.TrimSuffix(domain, "/tunnel")
-			domain = strings.TrimSuffix(domain, "/")
-			absoluteDownloadURL = fmt.Sprintf("%s%s", domain, downloadPath)
-		} else {
-			// Fall back to public domain
-			absoluteDownloadURL = fmt.Sprintf("https://ondata.ir%s", downloadPath)
-		}
-
-		logFn("INFO", "Assembling media post...")
-		ext := strings.ToLower(filepath.Ext(fileName))
-		caption := fmt.Sprintf("🎬 *CleverConnect Professional Share*\n\n"+
-			"📄 *File Name:* `%s`\n"+
-			"📏 *File Size:* `%s`\n"+
-			"🕒 *Uploaded At:* `%s`\n\n"+
-			"⚡ _Powered by CleverConnect Job Scheduler_",
-			fileName,
-			formatFileSize(info.Size()),
-			time.Now().Format("2006-01-02 15:04:05"),
-		)
-
-		var mediaOption message.MediaOption
-		mimeType := mime.TypeByExtension(ext)
-		if mimeType == "" {
-			mimeType = "application/octet-stream"
-		}
-
-		switch ext {
-		case ".jpg", ".jpeg", ".png", ".gif":
-			mediaOption = message.UploadedPhoto(inputFile, styling.Plain(caption))
-		case ".mp4":
-			doc := message.UploadedDocument(inputFile, styling.Plain(caption))
-			mediaOption = doc.MIME("video/mp4").Filename(fileName).Video().SupportsStreaming()
-		case ".mp3", ".m4a":
-			doc := message.UploadedDocument(inputFile, styling.Plain(caption))
-			mediaOption = doc.MIME(mimeType).Filename(fileName).Audio()
-		case ".ogg", ".opus":
-			doc := message.UploadedDocument(inputFile, styling.Plain(caption))
-			mediaOption = doc.MIME(mimeType).Filename(fileName).Audio().Voice()
-		default:
-			doc := message.UploadedDocument(inputFile, styling.Plain(caption))
-			doc.MIME(mimeType).Filename(fileName)
-			mediaOption = doc
-		}
-
-		// Send media post — only attach download button if URL is a valid public HTTPS link
 		sender := message.NewSender(api)
-
-		if strings.HasPrefix(absoluteDownloadURL, "https://") {
-			kbMarkup := &tg.ReplyInlineMarkup{
-				Rows: []tg.KeyboardButtonRow{
-					{
-						Buttons: []tg.KeyboardButtonClass{
-							&tg.KeyboardButtonURL{
-								Text: "📥 Download Direct Link",
-								URL:  absoluteDownloadURL,
-							},
+		htmlText := mdToHTML(initialText)
+		kbMarkup := &tg.ReplyInlineMarkup{
+			Rows: []tg.KeyboardButtonRow{
+				{
+					Buttons: []tg.KeyboardButtonClass{
+						&tg.KeyboardButtonCallback{
+							Text: "🔄 Restart Job",
+							Data: []byte(fmt.Sprintf("restart_job:%d", job.ID)),
 						},
 					},
 				},
+			},
+		}
+		msg, err := sender.To(peer).Markup(kbMarkup).StyledText(eng.gotdCtx, html.String(nil, htmlText))
+		if err == nil {
+			if upd, ok := msg.(*tg.UpdateShortSentMessage); ok {
+				pMsgID = upd.ID
+			} else if updates, ok := msg.(*tg.Updates); ok {
+				for _, u := range updates.Updates {
+					if newMessage, ok := u.(*tg.UpdateNewMessage); ok {
+						pMsgID = newMessage.Message.GetID()
+						break
+					}
+				}
 			}
-			_, mediaSentErr = sender.To(peer).Markup(kbMarkup).Media(ctx, mediaOption)
 		} else {
-			_, mediaSentErr = sender.To(peer).Media(ctx, mediaOption)
+			logFn("WARN", fmt.Sprintf("Failed to send initial progress message to Telegram (MTProto): %v", err))
 		}
+	}
 
-		if mediaSentErr != nil {
-			return fmt.Errorf("failed to send media post: %w", mediaSentErr)
-		}
+	// Use dynamic thread count based on file size (devgagantools-style)
+	threads := calculateOptimalThreads(info.Size())
 
-		logFn("INFO", "Media post sent successfully. Cleaning up progress message...")
-		if progressMsg != nil && eng.Bot != nil {
-			_ = eng.Bot.Delete(progressMsg)
-		} else if pMsgID != 0 {
-			_, _ = api.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{
-				ID:     []int{pMsgID},
-				Revoke: true,
-			})
-		}
+	// Initialize uploader progress tracker
+	progressTracker := &uploadProgress{
+		job:         job,
+		eng:         eng,
+		progressMsg: progressMsg,
+		fileName:    fileName,
+		startTime:   time.Now(),
+		lastUpdate:  time.Now(),
+		threads:     threads,
+		logFn:       logFn,
+		gotdClient:  eng.gotdClient,
+		gotdPeer:    peer,
+		gotdMsgID:   pMsgID,
+	}
 
-		return nil
+	logFn("INFO", fmt.Sprintf("Uploading file with %d parallel threads...", threads))
+	inputFile, err := FastUploadFile(eng.gotdCtx, eng.gotdClient, safePath, progressTracker)
+	if err != nil {
+		return fmt.Errorf("file upload failed: %w", err)
+	}
+
+	// Generate a JWT download token for the direct download button
+	appCfg := config.LoadConfig()
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"username": "admin",
+		"role":     "admin",
+		"exp":      time.Now().Add(7 * 24 * time.Hour).Unix(),
 	})
+	tokenString, err := token.SignedString(appCfg.JWTSecret)
+	if err != nil {
+		logFn("WARN", fmt.Sprintf("Failed to sign JWT download token: %v", err))
+	}
 
-	if runErr != nil {
+	// Construct absolute download link
+	var absoluteDownloadURL string
+	downloadPath := fmt.Sprintf("/api/files/stream?path=%s&download=true", url.QueryEscape(payload.FilePath))
+	if tokenString != "" {
+		downloadPath += fmt.Sprintf("&token=%s", url.QueryEscape(tokenString))
+	}
+
+	// Determine base host from Ehco config
+	var ehcoCfg models.EhcoClientConfig
+	if err := db.DB.First(&ehcoCfg).Error; err == nil && ehcoCfg.RemoteURL != "" {
+		domain := ehcoCfg.RemoteURL
+		domain = strings.Replace(domain, "wss://", "https://", 1)
+		domain = strings.Replace(domain, "ws://", "http://", 1)
+		domain = strings.TrimSuffix(domain, "/ws")
+		domain = strings.TrimSuffix(domain, "/tunnel")
+		domain = strings.TrimSuffix(domain, "/")
+		absoluteDownloadURL = fmt.Sprintf("%s%s", domain, downloadPath)
+	} else {
+		// Fall back to public domain
+		absoluteDownloadURL = fmt.Sprintf("https://ondata.ir%s", downloadPath)
+	}
+
+	logFn("INFO", "Assembling media post...")
+	ext := strings.ToLower(filepath.Ext(fileName))
+	caption := fmt.Sprintf("🎬 *CleverConnect Professional Share*\n\n"+
+		"📄 *File Name:* `%s`\n"+
+		"📏 *File Size:* `%s`\n"+
+		"🕒 *Uploaded At:* `%s`\n\n"+
+		"⚡ _Powered by CleverConnect Job Scheduler_",
+		fileName,
+		formatFileSize(info.Size()),
+		time.Now().Format("2006-01-02 15:04:05"),
+	)
+
+	var mediaOption message.MediaOption
+	mimeType := mime.TypeByExtension(ext)
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+
+	switch ext {
+	case ".jpg", ".jpeg", ".png", ".gif":
+		mediaOption = message.UploadedPhoto(inputFile, styling.Plain(caption))
+	case ".mp4", ".mkv", ".webm", ".avi", ".mov":
+		w, h, duration, videoCodec, audioCodec, totalBitrate, title, artist := probeMediaMetadata(safePath)
+
+		durationStr := "Unknown"
+		if duration > 0 {
+			durationStr = formatDuration(duration)
+		}
+
+		resStr := "Unknown"
+		if w > 0 && h > 0 {
+			resStr = formatResolution(w, h)
+		}
+
+		codecStr := "Unknown"
+		if videoCodec != "" || audioCodec != "" {
+			codecStr = formatCodecs(videoCodec, audioCodec)
+		}
+
+		bitrateStr := "Unknown"
+		if totalBitrate > 0 {
+			bitrateStr = formatBitrate(totalBitrate)
+		}
+
+		videoCaption := fmt.Sprintf("🎬 *CleverConnect Premium Share*\n\n"+
+			"📄 *File Name:* `%s`\n"+
+			"📏 *File Size:* `%s`\n"+
+			"🕒 *Duration:* `%s`\n"+
+			"🖥️ *Resolution:* `%s`\n"+
+			"⚙️ *Codecs:* `%s`\n"+
+			"⚡ *Bitrate:* `%s`\n"+
+			"📅 *Uploaded:* `%s`\n\n"+
+			"⚡ _Powered by CleverConnect Job Scheduler_",
+			fileName,
+			formatFileSize(info.Size()),
+			durationStr,
+			resStr,
+			codecStr,
+			bitrateStr,
+			time.Now().Format("2006-01-02 15:04:05"),
+		)
+
+		if title != "" {
+			prefix := fmt.Sprintf("🎵 *Title:* `%s`", title)
+			if artist != "" {
+				prefix += fmt.Sprintf(" - `%s`", artist)
+			}
+			videoCaption = prefix + "\n" + videoCaption
+		}
+
+		doc := message.UploadedDocument(inputFile, styling.Plain(videoCaption))
+		mimeStr := "video/mp4"
+		if ext == ".mkv" {
+			mimeStr = "video/x-matroska"
+		} else if ext == ".webm" {
+			mimeStr = "video/webm"
+		} else if ext == ".mov" {
+			mimeStr = "video/quicktime"
+		} else if ext == ".avi" {
+			mimeStr = "video/x-msvideo"
+		}
+
+		videoBuilder := doc.MIME(mimeStr).Filename(fileName).Video()
+		if w > 0 && h > 0 {
+			videoBuilder = videoBuilder.Resolution(w, h)
+		}
+		if duration > 0 {
+			videoBuilder = videoBuilder.DurationSeconds(duration)
+		}
+		mediaOption = videoBuilder.SupportsStreaming()
+
+	case ".mp3", ".m4a", ".flac", ".wav":
+		_, _, duration, _, _, _, title, artist := probeMediaMetadata(safePath)
+		
+		audioCaption := fmt.Sprintf("🎵 *CleverConnect Audio Share*\n\n"+
+			"📄 *File Name:* `%s`\n"+
+			"📏 *File Size:* `%s`\n"+
+			"🕒 *Duration:* `%s`\n"+
+			"📅 *Uploaded:* `%s`\n\n"+
+			"⚡ _Powered by CleverConnect Job Scheduler_",
+			fileName,
+			formatFileSize(info.Size()),
+			formatDuration(duration),
+			time.Now().Format("2006-01-02 15:04:05"),
+		)
+
+		if title != "" {
+			prefix := fmt.Sprintf("🎵 *Title:* `%s`", title)
+			if artist != "" {
+				prefix += fmt.Sprintf(" - `%s`", artist)
+			}
+			audioCaption = prefix + "\n" + audioCaption
+		}
+
+		doc := message.UploadedDocument(inputFile, styling.Plain(audioCaption))
+		audioBuilder := doc.MIME(mimeType).Filename(fileName).Audio()
+		if duration > 0 {
+			audioBuilder = audioBuilder.DurationSeconds(duration)
+		}
+		if title != "" {
+			audioBuilder = audioBuilder.Title(title)
+		} else {
+			audioBuilder = audioBuilder.Title(strings.TrimSuffix(fileName, filepath.Ext(fileName)))
+		}
+		if artist != "" {
+			audioBuilder = audioBuilder.Performer(artist)
+		}
+		mediaOption = audioBuilder
+
+	case ".ogg", ".opus":
+		_, _, duration, _, _, _, _, _ := probeMediaMetadata(safePath)
+		doc := message.UploadedDocument(inputFile, styling.Plain(caption))
+		audioBuilder := doc.MIME(mimeType).Filename(fileName).Audio().Voice()
+		if duration > 0 {
+			audioBuilder = audioBuilder.DurationSeconds(duration)
+		}
+		mediaOption = audioBuilder
+
+	default:
+		doc := message.UploadedDocument(inputFile, styling.Plain(caption))
+		doc.MIME(mimeType).Filename(fileName)
+		mediaOption = doc
+	}
+
+	// Send media post — only attach download button if URL is a valid public HTTPS link
+	sender := message.NewSender(api)
+
+	if strings.HasPrefix(absoluteDownloadURL, "https://") {
+		kbMarkup := &tg.ReplyInlineMarkup{
+			Rows: []tg.KeyboardButtonRow{
+				{
+					Buttons: []tg.KeyboardButtonClass{
+						&tg.KeyboardButtonURL{
+							Text: "📥 Download Direct Link",
+							URL:  absoluteDownloadURL,
+						},
+					},
+				},
+			},
+		}
+		_, mediaSentErr = sender.To(peer).Markup(kbMarkup).Media(eng.gotdCtx, mediaOption)
+	} else {
+		_, mediaSentErr = sender.To(peer).Media(eng.gotdCtx, mediaOption)
+	}
+
+	if mediaSentErr != nil {
 		// Attempt to update the progress message with error
+		errMsg := fmt.Sprintf("failed to send media post: %v", mediaSentErr)
+		errorText := formatErrorText(true, fileName, errMsg)
 		if progressMsg != nil && eng.Bot != nil {
-			_, _ = eng.Bot.Edit(progressMsg, fmt.Sprintf("❌ *Parallel Upload Failed*\n\nReason: %s", runErr.Error()), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
-		} else if pMsgID != 0 && eng.gotdClient != nil && pPeer != nil {
-			api := tg.NewClient(eng.gotdClient)
-			_, _ = api.MessagesEditMessage(ctx, &tg.MessagesEditMessageRequest{
+			_, _ = eng.Bot.Edit(progressMsg, errorText, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		} else if pMsgID != 0 && pPeer != nil {
+			_, _ = api.MessagesEditMessage(eng.gotdCtx, &tg.MessagesEditMessageRequest{
 				Peer:    pPeer,
 				ID:      pMsgID,
-				Message: fmt.Sprintf("❌ <b>Parallel Upload Failed</b>\n\nReason: %s", runErr.Error()),
+				Message: mdToHTML(errorText),
 			})
 		}
-		return runErr
+		return fmt.Errorf("%s", errMsg)
+	}
+
+	logFn("INFO", "Media post sent successfully. Cleaning up progress message...")
+	if progressMsg != nil && eng.Bot != nil {
+		_ = eng.Bot.Delete(progressMsg)
+	} else if pMsgID != 0 {
+		_, _ = api.MessagesDeleteMessages(eng.gotdCtx, &tg.MessagesDeleteMessagesRequest{
+			ID:     []int{pMsgID},
+			Revoke: true,
+		})
 	}
 
 	return nil
@@ -491,25 +587,824 @@ func resolveInputPeer(ctx context.Context, api *tg.Client, chatID int64) (tg.Inp
 	return &tg.InputPeerChat{ChatID: absID}, nil
 }
 
-// makeProgressBar creates a sleek visual progress bar
-func makeProgressBar(percent int, width int) string {
-	completed := percent * width / 100
-	if completed < 0 {
-		completed = 0
+// TelegramDownloadPayload represents the JSON payload for a Telegram download job.
+type TelegramDownloadPayload struct {
+	ChatID    int64 `json:"chat_id"`
+	MessageID int   `json:"message_id"`
+}
+
+// getMessage retrieves a specific message from Telegram by its ID.
+func (e *Engine) getMessage(ctx context.Context, api *tg.Client, peer tg.InputPeerClass, msgID int) (*tg.Message, error) {
+	var messagesSlice []tg.MessageClass
+
+	switch p := peer.(type) {
+	case *tg.InputPeerChannel:
+		channelInput := &tg.InputChannel{
+			ChannelID:  p.ChannelID,
+			AccessHash: p.AccessHash,
+		}
+		res, err := api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
+			Channel: channelInput,
+			ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: msgID}},
+		})
+		if err != nil {
+			return nil, err
+		}
+		switch val := res.(type) {
+		case *tg.MessagesMessagesSlice:
+			messagesSlice = val.Messages
+		case *tg.MessagesMessages:
+			messagesSlice = val.Messages
+		case *tg.MessagesChannelMessages:
+			messagesSlice = val.Messages
+		}
+	default:
+		res, err := api.MessagesGetMessages(ctx, []tg.InputMessageClass{&tg.InputMessageID{ID: msgID}})
+		if err != nil {
+			return nil, err
+		}
+		switch val := res.(type) {
+		case *tg.MessagesMessagesSlice:
+			messagesSlice = val.Messages
+		case *tg.MessagesMessages:
+			messagesSlice = val.Messages
+		}
 	}
+
+	if len(messagesSlice) == 0 {
+		return nil, fmt.Errorf("message not found")
+	}
+
+	msg, ok := messagesSlice[0].(*tg.Message)
+	if !ok {
+		return nil, fmt.Errorf("not a message type")
+	}
+
+	return msg, nil
+}
+
+// RunTelegramDownloadJob executes a parallel multi-connection file download from Telegram.
+func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn func(level, message string)) error {
+	logFn("INFO", "Telegram download job started")
+
+	var payload TelegramDownloadPayload
+	if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+		return fmt.Errorf("invalid payload: %w", err)
+	}
+
+	eng := GetEngine()
+	if eng == nil {
+		return fmt.Errorf("telegram bot engine is not initialized or running")
+	}
+
+
+	if eng.gotdClient == nil {
+		return fmt.Errorf("MTProto client is not initialized")
+	}
+
+	api := tg.NewClient(eng.gotdClient)
+
+	// 1. Resolve peer
+	peer, err := resolveInputPeer(eng.gotdCtx, api, payload.ChatID)
+	if err != nil {
+		return fmt.Errorf("failed to resolve peer for chat ID: %w", err)
+	}
+
+	// 2. Fetch the Telegram message containing the file
+	logFn("INFO", fmt.Sprintf("Fetching message ID %d from chat %d", payload.MessageID, payload.ChatID))
+	msg, err := eng.getMessage(eng.gotdCtx, api, peer, payload.MessageID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch message: %w", err)
+	}
+
+	// 3. Inspect message media
+	if msg.Media == nil {
+		return fmt.Errorf("message does not contain any media/file")
+	}
+
+	var fileLocation tg.InputFileLocationClass
+	var fileSize int64
+	var fileName string
+	var hasFile bool
+
+	switch media := msg.Media.(type) {
+	case *tg.MessageMediaDocument:
+		if doc, ok := media.Document.(*tg.Document); ok {
+			fileSize = doc.Size
+			hasFile = true
+			fileLocation = &tg.InputDocumentFileLocation{
+				ID:            doc.ID,
+				AccessHash:    doc.AccessHash,
+				FileReference: doc.FileReference,
+			}
+			for _, attr := range doc.Attributes {
+				if fAttr, ok := attr.(*tg.DocumentAttributeFilename); ok {
+					fileName = fAttr.FileName
+					break
+				}
+			}
+			if fileName == "" {
+				ext := "bin"
+				if mimeType := doc.MimeType; mimeType != "" {
+					if exts, err := mime.ExtensionsByType(mimeType); err == nil && len(exts) > 0 {
+						ext = strings.TrimPrefix(exts[0], ".")
+					}
+				}
+				fileName = fmt.Sprintf("document_%d.%s", doc.ID, ext)
+			}
+		}
+	case *tg.MessageMediaPhoto:
+		if photo, ok := media.Photo.(*tg.Photo); ok {
+			hasFile = true
+			fileName = fmt.Sprintf("photo_%d.jpg", photo.ID)
+			fileLocation = &tg.InputPhotoFileLocation{
+				ID:            photo.ID,
+				AccessHash:    photo.AccessHash,
+				FileReference: photo.FileReference,
+				ThumbSize:     "x",
+			}
+			for _, size := range photo.Sizes {
+				switch s := size.(type) {
+				case *tg.PhotoSize:
+					if s.Size > int(fileSize) {
+						fileSize = int64(s.Size)
+					}
+				case *tg.PhotoSizeProgressive:
+					if len(s.Sizes) > 0 {
+						last := s.Sizes[len(s.Sizes)-1]
+						if last > int(fileSize) {
+							fileSize = int64(last)
+						}
+					}
+				}
+			}
+			if fileSize == 0 {
+				fileSize = 1024 * 1024
+			}
+		}
+	}
+
+	if !hasFile || fileLocation == nil {
+		return fmt.Errorf("no downloadable document or photo found in message media")
+	}
+
+	// 4. Determine save path
+	relPath := filepath.Join("Downloads/telegram/files", fileName)
+	safePath, err := securePath(relPath)
+	if err != nil {
+		return fmt.Errorf("invalid save path: %w", err)
+	}
+
+	logFn("INFO", fmt.Sprintf("Downloading %s (size %s) to %s", fileName, FormatFileSize(fileSize), safePath))
+
+	// Pre-download check
+	var docID int64
+	if docLoc, ok := fileLocation.(*tg.InputDocumentFileLocation); ok {
+		docID = docLoc.ID
+	} else if photoLoc, ok := fileLocation.(*tg.InputPhotoFileLocation); ok {
+		docID = photoLoc.ID
+	}
+
+	if docID != 0 {
+		if matched, _, err := filecore.CheckDuplicateByTgID(docID, safePath); err == nil && matched {
+			logFn("INFO", fmt.Sprintf("Telegram file already exists (instant deduplication match for ID %d)", docID))
+
+			// Register file to ensure it's recorded correctly
+			_, _ = filecore.RegisterFile(safePath, "", "", docID, "")
+
+			// Instant completion updates in database
+			db.DB.Model(job).Updates(map[string]interface{}{
+				"progress": 100,
+				"status":   models.JobStatusCompleted,
+				"message":  fmt.Sprintf("Deduplicated: saved as %s", fileName),
+			})
+
+			// Generate success notification directly
+			appCfg := config.LoadConfig()
+			token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+				"username": "admin",
+				"role":     "admin",
+				"exp":      time.Now().Add(7 * 24 * time.Hour).Unix(),
+			})
+			tokenString, _ := token.SignedString(appCfg.JWTSecret)
+
+			var absoluteDownloadURL string
+			downloadPath := fmt.Sprintf("/api/files/stream?path=%s&download=true", url.QueryEscape(relPath))
+			if tokenString != "" {
+				downloadPath += fmt.Sprintf("&token=%s", url.QueryEscape(tokenString))
+			}
+
+			var ehcoCfg models.EhcoClientConfig
+			if err := db.DB.First(&ehcoCfg).Error; err == nil && ehcoCfg.RemoteURL != "" {
+				domain := ehcoCfg.RemoteURL
+				domain = strings.Replace(domain, "wss://", "https://", 1)
+				domain = strings.Replace(domain, "ws://", "http://", 1)
+				domain = strings.TrimSuffix(domain, "/ws")
+				domain = strings.TrimSuffix(domain, "/tunnel")
+				domain = strings.TrimSuffix(domain, "/")
+				absoluteDownloadURL = fmt.Sprintf("%s%s", domain, downloadPath)
+			} else {
+				absoluteDownloadURL = fmt.Sprintf("https://ondata.ir%s", downloadPath)
+			}
+
+			successText := formatSuccessText(false, fileName, fileSize, relPath)
+
+			if eng.Bot != nil {
+				kb := &tele.ReplyMarkup{}
+				btn := kb.URL("📥 Download Direct Link", absoluteDownloadURL)
+				kb.Inline(kb.Row(btn))
+				_, _ = eng.Bot.Send(tele.ChatID(payload.ChatID), successText, &tele.SendOptions{ParseMode: tele.ModeMarkdown, ReplyMarkup: kb})
+			} else {
+				kbMarkup := &tg.ReplyInlineMarkup{
+					Rows: []tg.KeyboardButtonRow{
+						{
+							Buttons: []tg.KeyboardButtonClass{
+								&tg.KeyboardButtonURL{
+									Text: "📥 Download Direct Link",
+									URL:  absoluteDownloadURL,
+								},
+							},
+						},
+					},
+				}
+				sender := message.NewSender(api)
+				htmlText := mdToHTML(successText)
+				_, _ = sender.To(peer).Markup(kbMarkup).StyledText(eng.gotdCtx, html.String(nil, htmlText))
+			}
+
+			return nil
+		}
+	}
+
+	// 5. Send initial progress message
+	var progressMsg *tele.Message
+	var pMsgID int
+	initialText := formatDownloadInitialText(fileName, fileSize)
+
+	if eng.Bot != nil {
+		btnRestart := tele.InlineButton{
+			Text:   "🔄 Restart Job",
+			Unique: "restart_job",
+			Data:   fmt.Sprintf("%d", job.ID),
+		}
+		inlineMarkup := &tele.ReplyMarkup{
+			InlineKeyboard: [][]tele.InlineButton{
+				{btnRestart},
+			},
+		}
+		msg, err := eng.Bot.Send(tele.ChatID(payload.ChatID), initialText, &tele.SendOptions{
+			ParseMode:   tele.ModeMarkdown,
+			ReplyMarkup: inlineMarkup,
+		})
+		if err != nil {
+			logFn("WARN", fmt.Sprintf("Failed to send initial download progress message to Telegram: %v", err))
+		} else {
+			progressMsg = msg
+		}
+	} else {
+		sender := message.NewSender(api)
+		htmlText := mdToHTML(initialText)
+		kbMarkup := &tg.ReplyInlineMarkup{
+			Rows: []tg.KeyboardButtonRow{
+				{
+					Buttons: []tg.KeyboardButtonClass{
+						&tg.KeyboardButtonCallback{
+							Text: "🔄 Restart Job",
+							Data: []byte(fmt.Sprintf("restart_job:%d", job.ID)),
+						},
+					},
+				},
+			},
+		}
+		msg, err := sender.To(peer).Markup(kbMarkup).StyledText(eng.gotdCtx, html.String(nil, htmlText))
+		if err == nil {
+			if upd, ok := msg.(*tg.UpdateShortSentMessage); ok {
+				pMsgID = upd.ID
+			} else if updates, ok := msg.(*tg.Updates); ok {
+				for _, u := range updates.Updates {
+					if newMessage, ok := u.(*tg.UpdateNewMessage); ok {
+						pMsgID = newMessage.Message.GetID()
+						break
+					}
+				}
+			}
+		} else {
+			logFn("WARN", fmt.Sprintf("Failed to send initial progress message to Telegram (MTProto): %v", err))
+		}
+	}
+
+	// 6. Download with progress callback
+	// Use eng.gotdCtx directly — exactly like uploads do. The scheduler's ctx is only
+	// used for job lifecycle tracking, not for the actual Telegram API call.
+	lastUpdate := time.Now()
+	startTime := time.Now()
+
+	err = FastDownloadFile(eng.gotdCtx, eng.gotdClient, fileLocation, safePath, fileSize, func(downloaded, total int64) {
+		percent := int(100 * float64(downloaded) / float64(total))
+		if percent > 100 {
+			percent = 100
+		}
+
+		// Update job progress in database
+		db.DB.Model(job).Updates(map[string]interface{}{
+			"progress": percent,
+			"message":  fmt.Sprintf("Downloading: %s / %s (%d%%)", FormatFileSize(downloaded), FormatFileSize(total), percent),
+		})
+
+		// Throttle updates
+		if time.Since(lastUpdate) > 1500*time.Millisecond {
+			lastUpdate = time.Now()
+			elapsed := time.Since(startTime).Seconds()
+			speed := 0.0
+			if elapsed > 0 {
+				speed = float64(downloaded) / elapsed / (1024 * 1024) // MB/s
+			}
+			progressText := formatDownloadProgressText(fileName, downloaded, total, percent, speed, elapsed)
+
+			if progressMsg != nil && eng.Bot != nil {
+				btnRestart := tele.InlineButton{
+					Text:   "🔄 Restart Job",
+					Unique: "restart_job",
+					Data:   fmt.Sprintf("%d", job.ID),
+				}
+				inlineMarkup := &tele.ReplyMarkup{
+					InlineKeyboard: [][]tele.InlineButton{
+						{btnRestart},
+					},
+				}
+				_, _ = eng.Bot.Edit(progressMsg, progressText, &tele.SendOptions{
+					ParseMode:   tele.ModeMarkdown,
+					ReplyMarkup: inlineMarkup,
+				})
+			} else if pMsgID != 0 {
+				htmlText := mdToHTML(progressText)
+				kbMarkup := &tg.ReplyInlineMarkup{
+					Rows: []tg.KeyboardButtonRow{
+						{
+							Buttons: []tg.KeyboardButtonClass{
+								&tg.KeyboardButtonCallback{
+									Text: "🔄 Restart Job",
+									Data: []byte(fmt.Sprintf("restart_job:%d", job.ID)),
+								},
+							},
+						},
+					},
+				}
+				_, _ = api.MessagesEditMessage(eng.gotdCtx, &tg.MessagesEditMessageRequest{
+					Peer:        peer,
+					ID:          pMsgID,
+					Message:     htmlText,
+					ReplyMarkup: kbMarkup,
+				})
+			}
+		}
+	})
+
+	if err != nil {
+		errMsg := fmt.Sprintf("Failed to download file: %v", err)
+		errorText := formatErrorText(false, fileName, errMsg)
+		if progressMsg != nil && eng.Bot != nil {
+			_, _ = eng.Bot.Edit(progressMsg, errorText, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		} else if pMsgID != 0 {
+			_, _ = api.MessagesEditMessage(eng.gotdCtx, &tg.MessagesEditMessageRequest{
+				Peer:    peer,
+				ID:      pMsgID,
+				Message: mdToHTML(errorText),
+			})
+		}
+		return err
+	}
+
+	// Register file after successful download
+	var regDocID int64
+	if docLoc, ok := fileLocation.(*tg.InputDocumentFileLocation); ok {
+		regDocID = docLoc.ID
+	} else if photoLoc, ok := fileLocation.(*tg.InputPhotoFileLocation); ok {
+		regDocID = photoLoc.ID
+	}
+
+	if _, err := filecore.RegisterFile(safePath, "", "", regDocID, ""); err != nil {
+		logFn("WARN", fmt.Sprintf("Failed to register downloaded file in registry: %v", err))
+	}
+
+	// 7. Success! Generate download URL
+	appCfg := config.LoadConfig()
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"username": "admin",
+		"role":     "admin",
+		"exp":      time.Now().Add(7 * 24 * time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString(appCfg.JWTSecret)
+	if err != nil {
+		logFn("WARN", fmt.Sprintf("Failed to sign JWT download token: %v", err))
+	}
+
+	var absoluteDownloadURL string
+	downloadPath := fmt.Sprintf("/api/files/stream?path=%s&download=true", url.QueryEscape(relPath))
+	if tokenString != "" {
+		downloadPath += fmt.Sprintf("&token=%s", url.QueryEscape(tokenString))
+	}
+
+	var ehcoCfg models.EhcoClientConfig
+	if err := db.DB.First(&ehcoCfg).Error; err == nil && ehcoCfg.RemoteURL != "" {
+		domain := ehcoCfg.RemoteURL
+		domain = strings.Replace(domain, "wss://", "https://", 1)
+		domain = strings.Replace(domain, "ws://", "http://", 1)
+		domain = strings.TrimSuffix(domain, "/ws")
+		domain = strings.TrimSuffix(domain, "/tunnel")
+		domain = strings.TrimSuffix(domain, "/")
+		absoluteDownloadURL = fmt.Sprintf("%s%s", domain, downloadPath)
+	} else {
+		absoluteDownloadURL = fmt.Sprintf("https://ondata.ir%s", downloadPath)
+	}
+
+	successText := formatSuccessText(false, fileName, fileSize, relPath)
+
+	logFn("INFO", "File downloaded successfully. Updating Telegram message with download link...")
+
+	if progressMsg != nil && eng.Bot != nil {
+		kb := &tele.ReplyMarkup{}
+		btn := kb.URL("📥 Download Direct Link", absoluteDownloadURL)
+		kb.Inline(kb.Row(btn))
+		_, _ = eng.Bot.Edit(progressMsg, successText, &tele.SendOptions{ParseMode: tele.ModeMarkdown, ReplyMarkup: kb})
+	} else if pMsgID != 0 {
+		kbMarkup := &tg.ReplyInlineMarkup{
+			Rows: []tg.KeyboardButtonRow{
+				{
+					Buttons: []tg.KeyboardButtonClass{
+						&tg.KeyboardButtonURL{
+							Text: "📥 Download Direct Link",
+							URL:  absoluteDownloadURL,
+						},
+					},
+				},
+			},
+		}
+		htmlText := mdToHTML(successText)
+		_, _ = api.MessagesEditMessage(eng.gotdCtx, &tg.MessagesEditMessageRequest{
+			Peer:        peer,
+			ID:          pMsgID,
+			Message:     htmlText,
+			ReplyMarkup: kbMarkup,
+		})
+	}
+
+	return nil
+}
+
+// makeProgressBar creates a premium animated-style progress bar using Unicode block characters.
+// The bar uses a gradient fill with a cursor indicator for a modern look.
+func makeProgressBar(percent int, width int) string {
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+
+	completed := percent * width / 100
 	if completed > width {
 		completed = width
 	}
 	remaining := width - completed
 
+	// Gradient fill characters for a colorful look
+	const (
+		fillChar  = "▓"
+		emptyChar = "░"
+		leftCap   = "▐"
+		rightCap  = "▌"
+	)
+
+	// Choose indicator emoji based on progress range
+	var indicator string
+	switch {
+	case percent >= 100:
+		indicator = "✅"
+	case percent >= 75:
+		indicator = "🟢"
+	case percent >= 50:
+		indicator = "🔵"
+	case percent >= 25:
+		indicator = "🟡"
+	default:
+		indicator = "🟠"
+	}
+
 	var sb strings.Builder
-	sb.WriteString("[")
+	sb.WriteString(indicator)
+	sb.WriteString(" ")
+	sb.WriteString(leftCap)
 	for i := 0; i < completed; i++ {
-		sb.WriteString("■")
+		sb.WriteString(fillChar)
 	}
 	for i := 0; i < remaining; i++ {
-		sb.WriteString("░")
+		sb.WriteString(emptyChar)
 	}
-	sb.WriteString("]")
+	sb.WriteString(rightCap)
+	sb.WriteString(fmt.Sprintf(" `%d%%`", percent))
 	return sb.String()
+}
+
+// formatETA calculates and formats the estimated time remaining.
+func formatETA(downloaded, total int64, elapsed float64) string {
+	if downloaded <= 0 || elapsed <= 0 {
+		return "calculating..."
+	}
+	speed := float64(downloaded) / elapsed
+	if speed <= 0 {
+		return "∞"
+	}
+	remaining := float64(total-downloaded) / speed
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	mins := int(remaining) / 60
+	secs := int(remaining) % 60
+	if mins > 60 {
+		hours := mins / 60
+		mins = mins % 60
+		return fmt.Sprintf("%dh %dm", hours, mins)
+	}
+	if mins > 0 {
+		return fmt.Sprintf("%dm %ds", mins, secs)
+	}
+	return fmt.Sprintf("%ds", secs)
+}
+
+// formatUploadProgressText builds the premium upload progress message.
+func formatUploadProgressText(fileName string, uploaded, total int64, percent int, speed float64, elapsed float64) string {
+	eta := formatETA(uploaded, total, elapsed)
+
+	return fmt.Sprintf(
+		"╔══════════════════════╗\n"+
+			"   📤  *UPLOADING FILE*\n"+
+			"╚══════════════════════╝\n\n"+
+			"📄 *File:* `%s`\n"+
+			"📦 *Size:* `%s`\n\n"+
+			"📊 *Progress:*\n"+
+			"%s\n"+
+			"💾 `%s` / `%s`\n\n"+
+			"⚡ *Speed:* `%.2f MB/s`\n"+
+			"⏱ *ETA:* `%s`\n\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━\n"+
+			"🔷 _CleverConnect Engine_",
+		fileName,
+		formatFileSize(total),
+		makeProgressBar(percent, 15),
+		formatFileSize(uploaded),
+		formatFileSize(total),
+		speed,
+		eta,
+	)
+}
+
+// formatDownloadProgressText builds the premium download progress message.
+func formatDownloadProgressText(fileName string, downloaded, total int64, percent int, speed float64, elapsed float64) string {
+	eta := formatETA(downloaded, total, elapsed)
+
+	return fmt.Sprintf(
+		"╔══════════════════════╗\n"+
+			"   📥  *DOWNLOADING FILE*\n"+
+			"╚══════════════════════╝\n\n"+
+			"📄 *File:* `%s`\n"+
+			"📦 *Size:* `%s`\n\n"+
+			"📊 *Progress:*\n"+
+			"%s\n"+
+			"💾 `%s` / `%s`\n\n"+
+			"⚡ *Speed:* `%.2f MB/s`\n"+
+			"⏱ *ETA:* `%s`\n\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━\n"+
+			"🔷 _CleverConnect Engine_",
+		fileName,
+		FormatFileSize(total),
+		makeProgressBar(percent, 15),
+		FormatFileSize(downloaded),
+		FormatFileSize(total),
+		speed,
+		eta,
+	)
+}
+
+// formatUploadInitialText builds the premium initial upload message.
+func formatUploadInitialText(fileName string, fileSize int64) string {
+	return fmt.Sprintf(
+		"╔══════════════════════╗\n"+
+			"   📤  *STARTING UPLOAD*\n"+
+			"╚══════════════════════╝\n\n"+
+			"📄 *File:* `%s`\n"+
+			"📦 *Size:* `%s`\n\n"+
+			"📊 *Progress:*\n"+
+			"%s\n\n"+
+			"⏳ _Initializing parallel transfer..._\n\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━\n"+
+			"🔷 _CleverConnect Engine_",
+		fileName,
+		formatFileSize(fileSize),
+		makeProgressBar(0, 15),
+	)
+}
+
+// formatDownloadInitialText builds the premium initial download message.
+func formatDownloadInitialText(fileName string, fileSize int64) string {
+	return fmt.Sprintf(
+		"╔══════════════════════╗\n"+
+			"   📥  *STARTING DOWNLOAD*\n"+
+			"╚══════════════════════╝\n\n"+
+			"📄 *File:* `%s`\n"+
+			"📦 *Size:* `%s`\n\n"+
+			"📊 *Progress:*\n"+
+			"%s\n\n"+
+			"⏳ _Initializing parallel transfer..._\n\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━\n"+
+			"🔷 _CleverConnect Engine_",
+		fileName,
+		FormatFileSize(fileSize),
+		makeProgressBar(0, 15),
+	)
+}
+
+// formatSuccessText builds the premium download/upload completion message.
+func formatSuccessText(isUpload bool, fileName string, fileSize int64, savedPath string) string {
+	icon := "📥"
+	action := "DOWNLOAD"
+	if isUpload {
+		icon = "📤"
+		action = "UPLOAD"
+	}
+
+	return fmt.Sprintf(
+		"╔══════════════════════╗\n"+
+			"   %s  *%s COMPLETE*\n"+
+			"╚══════════════════════╝\n\n"+
+			"✅ *Status:* `Success`\n\n"+
+			"📄 *File:* `%s`\n"+
+			"📦 *Size:* `%s`\n"+
+			"📁 *Path:* `%s`\n\n"+
+			"%s\n\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━\n"+
+			"🔷 _CleverConnect Engine_",
+		icon, action,
+		fileName,
+		FormatFileSize(fileSize),
+		savedPath,
+		makeProgressBar(100, 15),
+	)
+}
+
+// formatErrorText builds the premium error message.
+func formatErrorText(isUpload bool, fileName string, errMsg string) string {
+	icon := "📥"
+	action := "DOWNLOAD"
+	if isUpload {
+		icon = "📤"
+		action = "UPLOAD"
+	}
+
+	return fmt.Sprintf(
+		"╔══════════════════════╗\n"+
+			"   %s  *%s FAILED*\n"+
+			"╚══════════════════════╝\n\n"+
+			"❌ *Status:* `Error`\n\n"+
+			"📄 *File:* `%s`\n"+
+			"⚠️ *Reason:*\n`%s`\n\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━\n"+
+			"🔷 _CleverConnect Engine_",
+		icon, action,
+		fileName,
+		errMsg,
+	)
+}
+
+type ffprobeOutput struct {
+	Streams []struct {
+		Width      int    `json:"width"`
+		Height     int    `json:"height"`
+		Duration   string `json:"duration"`
+		CodecType  string `json:"codec_type"`
+		CodecName  string `json:"codec_name"`
+		BitRate    string `json:"bit_rate"`
+	} `json:"streams"`
+	Format struct {
+		Duration string            `json:"duration"`
+		Tags     map[string]string `json:"tags"`
+		BitRate  string            `json:"bit_rate"`
+	} `json:"format"`
+}
+
+func probeMediaMetadata(filePath string) (w, h, duration int, videoCodec, audioCodec string, totalBitrate int64, title, artist string) {
+	cmd := exec.Command("ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", filePath)
+	out, err := cmd.Output()
+	if err != nil {
+		return
+	}
+
+	var data ffprobeOutput
+	if err := json.Unmarshal(out, &data); err != nil {
+		return
+	}
+
+	// 1. Parse Streams
+	for _, stream := range data.Streams {
+		if stream.CodecType == "video" {
+			w = stream.Width
+			h = stream.Height
+			videoCodec = stream.CodecName
+		} else if stream.CodecType == "audio" {
+			audioCodec = stream.CodecName
+		}
+	}
+
+	// 2. Parse Duration
+	var durStr string
+	if data.Format.Duration != "" {
+		durStr = data.Format.Duration
+	} else {
+		for _, stream := range data.Streams {
+			if stream.Duration != "" {
+				durStr = stream.Duration
+				break
+			}
+		}
+	}
+	if durStr != "" {
+		if f, err := strconv.ParseFloat(durStr, 64); err == nil {
+			duration = int(f)
+		}
+	}
+
+	// 3. Parse Bitrate
+	if data.Format.BitRate != "" {
+		if br, err := strconv.ParseInt(data.Format.BitRate, 10, 64); err == nil {
+			totalBitrate = br
+		}
+	}
+
+	// 4. Parse Tags
+	if data.Format.Tags != nil {
+		for k, v := range data.Format.Tags {
+			lk := strings.ToLower(k)
+			if lk == "title" {
+				title = v
+			} else if lk == "artist" || lk == "performer" {
+				artist = v
+			}
+		}
+	}
+
+	return
+}
+
+func formatDuration(sec int) string {
+	h := sec / 3600
+	m := (sec % 3600) / 60
+	s := sec % 60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%d:%02d", m, s)
+}
+
+func formatResolution(w, h int) string {
+	if w == 0 || h == 0 {
+		return "Unknown"
+	}
+	label := "SD"
+	switch {
+	case h >= 2160:
+		label = "4K UHD"
+	case h >= 1440:
+		label = "2K QHD"
+	case h >= 1080:
+		label = "1080p FHD"
+	case h >= 720:
+		label = "720p HD"
+	}
+	return fmt.Sprintf("%dx%d (%s)", w, h, label)
+}
+
+func formatBitrate(bps int64) string {
+	if bps == 0 {
+		return "Unknown"
+	}
+	mbps := float64(bps) / 1000000.0
+	if mbps >= 1.0 {
+		return fmt.Sprintf("%.2f Mbps", mbps)
+	}
+	kbps := float64(bps) / 1000.0
+	return fmt.Sprintf("%.0f Kbps", kbps)
+}
+
+func formatCodecs(vc, ac string) string {
+	if vc == "" && ac == "" {
+		return "Unknown"
+	}
+	if vc == "" {
+		return strings.ToUpper(ac)
+	}
+	if ac == "" {
+		return strings.ToUpper(vc)
+	}
+	return fmt.Sprintf("%s / %s", strings.ToUpper(vc), strings.ToUpper(ac))
 }

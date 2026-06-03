@@ -1,20 +1,62 @@
 package telegram
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"math"
 	"mime"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"clever-connect/internal/logger"
 
+	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/downloader"
+	"github.com/gotd/td/telegram/uploader"
+	"github.com/gotd/td/tg"
 	tele "gopkg.in/telebot.v4"
 )
 
 // QueueUploadJob is a callback registered by the scheduler engine to queue Telegram upload jobs.
 var QueueUploadJob func(filePath string, chatID int64) error
+
+// QueueDownloadJob is a callback registered by the scheduler engine to queue Telegram download jobs.
+var QueueDownloadJob func(chatID int64, messageID int, fileName string, fileSize int64) error
+
+// RetryJob is a callback registered by the scheduler engine to retry/restart a job.
+var RetryJob func(jobID uint) error
+
+type progressWriterAt struct {
+	writer     io.WriterAt
+	total      int64
+	downloaded int64
+	onProgress func(downloaded, total int64)
+	mu         sync.Mutex
+}
+
+func (p *progressWriterAt) WriteAt(b []byte, off int64) (int, error) {
+	n, err := p.writer.WriteAt(b, off)
+	if n > 0 {
+		p.mu.Lock()
+		p.downloaded += int64(n)
+		downloaded := p.downloaded
+		p.mu.Unlock()
+		if p.onProgress != nil {
+			p.onProgress(downloaded, p.total)
+		}
+	}
+	return n, err
+}
+
+// FormatFileSize formats file size in bytes to human-readable string.
+func FormatFileSize(bytes int64) string {
+	return formatFileSize(bytes)
+}
 
 // fileManagerRoot is the base directory for the server file manager.
 // This matches the FileHandler's rootDir in handlers/files.go.
@@ -297,4 +339,288 @@ func formatFileSize(bytes int64) string {
 	default:
 		return fmt.Sprintf("%d B", bytes)
 	}
+}
+
+// ──────────────────────────────────────────────────────────────
+// High-Performance MTProto Transfer Functions
+// Inspired by devgagantools ParallelTransferrer
+// ──────────────────────────────────────────────────────────────
+
+// calculateOptimalThreads determines the optimal number of concurrent upload/download
+// goroutines based on file size. Uses conservative scaling to avoid overwhelming
+// the MTProto connection pool (which causes "engine forcibly closed" errors).
+//
+// Thread scaling strategy:
+//   - Files < 50MB   → 1 thread  (no parallelism needed)
+//   - Files 50-200MB → 2 threads
+//   - Files 200-500MB→ 4 threads
+//   - Files 500MB-1GB→ 6 threads
+//   - Files 1-2GB   → 8 threads
+//   - Files > 2GB   → 10 threads (conservative max — pool stability matters more than raw speed)
+func calculateOptimalThreads(fileSize int64) int {
+	const (
+		MB50  = 50 * 1024 * 1024
+		MB200 = 200 * 1024 * 1024
+		MB500 = 500 * 1024 * 1024
+		GB1   = 1024 * 1024 * 1024
+		GB2   = 2 * GB1
+	)
+
+	switch {
+	case fileSize < MB50:
+		return 1
+	case fileSize < MB200:
+		return 2
+	case fileSize < MB500:
+		return 4
+	case fileSize < GB1:
+		return 6
+	case fileSize < GB2:
+		return 8
+	default:
+		return 10
+	}
+}
+
+// calculateUploadThreads is a slightly more aggressive thread count for uploads,
+// since uploads are more tolerant of parallel connections than downloads.
+func calculateUploadThreads(fileSize int64) int {
+	const (
+		MB100 = 100 * 1024 * 1024
+		MB500 = 500 * 1024 * 1024
+		GB1   = 1024 * 1024 * 1024
+		GB2   = 2 * GB1
+	)
+
+	switch {
+	case fileSize < MB100:
+		return 1
+	case fileSize < MB500:
+		return 4
+	case fileSize < GB1:
+		return 8
+	case fileSize < GB2:
+		return 12
+	default:
+		threads := int(math.Ceil(float64(fileSize) / float64(MB100)))
+		if threads > 16 {
+			threads = 16
+		}
+		return threads
+	}
+}
+
+// FastUploadFile uploads a file using concurrent goroutines via the gotd MTProto uploader.
+// It automatically calculates optimal threads based on file size.
+// The progress parameter is optional — pass nil to skip progress tracking.
+func FastUploadFile(ctx context.Context, client *telegram.Client, filePath string, progress uploader.Progress) (tg.InputFileClass, error) {
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("file not found: %w", err)
+	}
+
+	threads := calculateUploadThreads(info.Size())
+
+	var invoker tg.Invoker = client
+	if threads > 1 {
+		poolInvoker, err := client.Pool(int64(threads))
+		if err != nil {
+			logger.Warn("Telegram", "Failed to create connection pool for upload, using single connection", "error", err)
+		} else {
+			defer poolInvoker.Close()
+			invoker = poolInvoker
+		}
+	}
+
+	api := tg.NewClient(invoker)
+
+	up := uploader.NewUploader(api).
+		WithThreads(threads).
+		WithPartSize(512 * 1024) // 512KB chunks — maximum for speed
+
+	if progress != nil {
+		up = up.WithProgress(progress)
+	}
+
+	logger.Info("Telegram", "Starting fast parallel upload",
+		"file", filepath.Base(filePath),
+		"size", formatFileSize(info.Size()),
+		"threads", threads,
+	)
+
+	inputFile, err := up.FromPath(ctx, filePath)
+	if err != nil {
+		return nil, fmt.Errorf("parallel upload failed: %w", err)
+	}
+
+	logger.Info("Telegram", "Fast parallel upload completed",
+		"file", filepath.Base(filePath),
+		"threads", threads,
+	)
+
+	return inputFile, nil
+}
+
+// FastDownloadFile downloads a file from Telegram using the gotd MTProto downloader.
+// It uses the primary client connection directly (NO pool) — exactly like uploads work.
+//
+// The gotd downloader.Parallel() creates multiple goroutines requesting different byte
+// offsets concurrently. They all share the single primary MTProto connection which is
+// already authenticated and stable. This avoids the "invoke pool: engine forcibly closed"
+// error that occurs when client.Pool() creates extra connections that fail auth-transfer.
+//
+// Retry strategy: parallel → retry with fewer threads → sequential stream fallback.
+func FastDownloadFile(ctx context.Context, client *telegram.Client, fileLocation tg.InputFileLocationClass, destPath string, fileSize int64, onProgress func(downloaded, total int64)) error {
+	// Ensure destination directory exists
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		return fmt.Errorf("failed to create download directory: %w", err)
+	}
+
+	threads := calculateOptimalThreads(fileSize)
+
+	logger.Info("Telegram", "Starting Telegram download (no pool, direct client)",
+		"dest", filepath.Base(destPath),
+		"size", formatFileSize(fileSize),
+		"threads", threads,
+	)
+
+	// Use the client directly as invoker — NO Pool(). This is the key fix.
+	// The primary MTProto connection is already authenticated and stable.
+	// Multiple download goroutines share this single connection safely.
+	api := tg.NewClient(client)
+
+	var lastErr error
+
+	for attempt := 0; attempt < 3; attempt++ {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("download cancelled: %w", ctx.Err())
+		default:
+		}
+
+		if attempt > 0 {
+			backoff := time.Duration(1<<uint(attempt)) * time.Second
+			logger.Warn("Telegram", "Retrying download",
+				"attempt", attempt+1, "threads", threads, "backoff", backoff, "error", lastErr)
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("download cancelled during backoff: %w", ctx.Err())
+			case <-time.After(backoff):
+			}
+		}
+
+		lastErr = doDownloadParallel(ctx, api, fileLocation, destPath, fileSize, threads, onProgress)
+		if lastErr == nil {
+			logger.Info("Telegram", "Download completed",
+				"dest", filepath.Base(destPath), "size", formatFileSize(fileSize), "attempt", attempt+1)
+			return nil
+		}
+
+		if ctx.Err() != nil {
+			return fmt.Errorf("download cancelled: %w", ctx.Err())
+		}
+
+		// Reduce threads for next attempt
+		threads = threads / 2
+		if threads < 1 {
+			threads = 1
+		}
+		logger.Warn("Telegram", "Download attempt failed", "attempt", attempt+1, "error", lastErr)
+	}
+
+	// Final fallback: sequential stream (single goroutine, no parallelism at all)
+	logger.Warn("Telegram", "Falling back to sequential stream download", "error", lastErr)
+	streamErr := doDownloadStream(ctx, api, fileLocation, destPath, fileSize, onProgress)
+	if streamErr == nil {
+		logger.Info("Telegram", "Stream fallback download completed", "dest", filepath.Base(destPath))
+		return nil
+	}
+
+	return fmt.Errorf("download failed after all attempts (parallel: %v, stream: %w)", lastErr, streamErr)
+}
+
+// doDownloadParallel performs a parallel download using the given API client (no pool).
+func doDownloadParallel(ctx context.Context, api *tg.Client, fileLocation tg.InputFileLocationClass, destPath string, fileSize int64, threads int, onProgress func(downloaded, total int64)) error {
+	dl := downloader.NewDownloader().WithPartSize(512 * 1024)
+
+	f, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("open file: %w", err)
+	}
+	defer f.Close()
+
+	if fileSize > 0 {
+		_ = f.Truncate(fileSize)
+	}
+
+	var writer io.WriterAt = f
+	if onProgress != nil {
+		writer = &progressWriterAt{writer: f, total: fileSize, onProgress: onProgress}
+	}
+
+	_, err = dl.Download(api, fileLocation).WithThreads(threads).Parallel(ctx, writer)
+	if err != nil {
+		return fmt.Errorf("parallel download failed (threads=%d): %w", threads, err)
+	}
+	return nil
+}
+
+// doDownloadStream performs a sequential stream download (most reliable, single goroutine).
+func doDownloadStream(ctx context.Context, api *tg.Client, fileLocation tg.InputFileLocationClass, destPath string, fileSize int64, onProgress func(downloaded, total int64)) error {
+	dl := downloader.NewDownloader().WithPartSize(512 * 1024)
+
+	f, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("open file: %w", err)
+	}
+	defer f.Close()
+
+	var writer io.Writer = f
+	if onProgress != nil {
+		writer = &progressWriter{writer: f, total: fileSize, onProgress: onProgress}
+	}
+
+	_, err = dl.Download(api, fileLocation).Stream(ctx, writer)
+	if err != nil {
+		return fmt.Errorf("stream download failed: %w", err)
+	}
+	return nil
+}
+
+// progressWriter wraps an io.Writer to track sequential write progress.
+// Used by the fallback stream download path.
+type progressWriter struct {
+	writer     io.Writer
+	total      int64
+	downloaded int64
+	onProgress func(downloaded, total int64)
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	n, err := p.writer.Write(b)
+	if n > 0 {
+		p.downloaded += int64(n)
+		if p.onProgress != nil {
+			p.onProgress(p.downloaded, p.total)
+		}
+	}
+	return n, err
+}
+
+// ProgressReader wraps an io.Reader to track bytes read and report progress.
+// This is useful for streaming uploads with real-time progress bars in the Web UI.
+type ProgressReader struct {
+	Reader    io.Reader
+	Total     int64
+	Read_     int64
+	OnUpdate  func(bytesRead, totalBytes int64) // Called periodically
+}
+
+func (pr *ProgressReader) Read(p []byte) (int, error) {
+	n, err := pr.Reader.Read(p)
+	pr.Read_ += int64(n)
+	if pr.OnUpdate != nil {
+		pr.OnUpdate(pr.Read_, pr.Total)
+	}
+	return n, err
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"clever-connect/internal/db"
+	"clever-connect/internal/downloader"
 	"clever-connect/internal/logger"
 	"clever-connect/internal/models"
 	"clever-connect/internal/telegram"
@@ -98,6 +99,55 @@ func Init() {
 			)
 			return err
 		}
+
+		// Initialize QueueDownloadJob in telegram package
+		telegram.QueueDownloadJob = func(chatID int64, messageID int, fileName string, fileSize int64) error {
+			payload := telegram.TelegramDownloadPayload{
+				ChatID:    chatID,
+				MessageID: messageID,
+			}
+			payloadBytes, err := json.Marshal(payload)
+			if err != nil {
+				return err
+			}
+			_, err = Engine.SubmitJob(
+				"telegram_download",
+				fmt.Sprintf("Download %s", fileName),
+				fmt.Sprintf("Parallel download of %s (size %s) from Telegram", fileName, telegram.FormatFileSize(fileSize)),
+				"download",
+				5,
+				string(payloadBytes),
+				"",
+			)
+			return err
+		}
+
+		// Initialize RetryJob in telegram package
+		telegram.RetryJob = func(jobID uint) error {
+			return Engine.RetryJob(jobID)
+		}
+
+		// Register auto-upload callback for the downloader bridge
+		downloader.RegisterAutoUploadFunc(func(filePath string, chatID int64) error {
+			payload := telegram.TelegramUploadPayload{
+				FilePath: filePath,
+				ChatID:   chatID,
+			}
+			payloadBytes, err := json.Marshal(payload)
+			if err != nil {
+				return err
+			}
+			_, err = Engine.SubmitJob(
+				"telegram_upload",
+				fmt.Sprintf("Auto-Upload %s", filepath.Base(filePath)),
+				fmt.Sprintf("Auto-upload of %s to Telegram after download completed", filepath.Base(filePath)),
+				"files",
+				5,
+				string(payloadBytes),
+				"",
+			)
+			return err
+		})
 
 		// Reset stale "running" jobs from a previous crash
 		db.DB.Model(&models.SchedulerJob{}).
@@ -455,33 +505,40 @@ func (s *Scheduler) dispatchJobs() {
 		Find(&pendingJobs)
 
 	for _, job := range pendingJobs {
+		s.mu.Lock()
+		if _, active := s.activeJobs[job.ID]; active {
+			s.mu.Unlock()
+			continue
+		}
+
+		// Load config for timeout
+		var cfg models.SchedulerConfig
+		timeout := 3600 * time.Second
+		if err := db.DB.First(&cfg).Error; err == nil && cfg.JobTimeoutSeconds > 0 {
+			timeout = time.Duration(cfg.JobTimeoutSeconds) * time.Second
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		s.activeJobs[job.ID] = cancel
+		s.mu.Unlock()
+
+		// Update database status synchronously to prevent double execution in subsequent queue scans
+		now := time.Now()
+		db.DB.Model(&job).Updates(map[string]interface{}{
+			"status":     models.JobStatusRunning,
+			"started_at": now,
+			"message":    "Executing...",
+		})
+
 		jobCopy := job
-		go s.executeJob(&jobCopy)
+		jobCopy.Status = models.JobStatusRunning
+		jobCopy.StartedAt = &now
+
+		go s.executeJob(&jobCopy, ctx, cancel)
 	}
 }
 
-func (s *Scheduler) executeJob(job *models.SchedulerJob) {
-	// Load config for timeout
-	var cfg models.SchedulerConfig
-	timeout := 3600 * time.Second
-	if err := db.DB.First(&cfg).Error; err == nil && cfg.JobTimeoutSeconds > 0 {
-		timeout = time.Duration(cfg.JobTimeoutSeconds) * time.Second
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-
-	// Register active job
-	s.mu.Lock()
-	s.activeJobs[job.ID] = cancel
-	s.mu.Unlock()
-
-	now := time.Now()
-	db.DB.Model(job).Updates(map[string]interface{}{
-		"status":     models.JobStatusRunning,
-		"started_at": now,
-		"message":    "Executing...",
-	})
-
+func (s *Scheduler) executeJob(job *models.SchedulerJob, ctx context.Context, cancel context.CancelFunc) {
 	s.addLog(job.ID, "INFO", "Job execution started")
 
 	// Lookup handler
@@ -508,6 +565,14 @@ func (s *Scheduler) executeJob(job *models.SchedulerJob) {
 	s.mu.Unlock()
 
 	finishedAt := time.Now()
+	var cfg models.SchedulerConfig
+
+	var startedAt time.Time
+	if job.StartedAt != nil {
+		startedAt = *job.StartedAt
+	} else {
+		startedAt = time.Now()
+	}
 
 	if execErr != nil {
 		// Check if it was cancelled
@@ -566,7 +631,7 @@ func (s *Scheduler) executeJob(job *models.SchedulerJob) {
 		logger.Info("Scheduler", "Job completed",
 			"id", job.ID,
 			"type", job.Type,
-			"duration", finishedAt.Sub(now).String(),
+			"duration", finishedAt.Sub(startedAt).String(),
 		)
 	}
 
@@ -744,6 +809,11 @@ func (s *Scheduler) registerBuiltinJobs() {
 	// Telegram parallel multi-connection file upload
 	s.RegisterJob("telegram_upload", func(ctx context.Context, job *models.SchedulerJob, logFn func(string, string)) error {
 		return telegram.RunTelegramUploadJob(ctx, job, logFn)
+	})
+
+	// Telegram parallel multi-connection file download
+	s.RegisterJob("telegram_download", func(ctx context.Context, job *models.SchedulerJob, logFn func(string, string)) error {
+		return telegram.RunTelegramDownloadJob(ctx, job, logFn)
 	})
 }
 
