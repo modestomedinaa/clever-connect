@@ -5,7 +5,7 @@ import {
 	FiGrid, FiList, FiRefreshCw, FiArrowLeft, FiEdit3, 
 	FiImage, FiVideo, FiZoomIn, FiZoomOut, FiRotateCw, FiX, FiCheck,
 	FiChevronRight, FiChevronDown, FiScissors, FiCopy, FiClipboard, FiInfo, FiArchive, FiShare2,
-	FiPlay, FiPause, FiMaximize2, FiChevronLeft
+	FiPlay, FiPause, FiMaximize2, FiChevronLeft, FiExternalLink
 } from 'react-icons/fi';
 import Editor from '@monaco-editor/react';
 import videojs from 'video.js';
@@ -47,6 +47,25 @@ const getMonacoLanguage = (ext: string): string => {
 	if (e === '.sh') return 'shell';
 	if (e === '.yml' || e === '.yaml') return 'yaml';
 	return 'plaintext';
+};
+
+const formatDuration = (secs: number): string => {
+	if (isNaN(secs)) return 'Unknown';
+	const h = Math.floor(secs / 3600);
+	const m = Math.floor((secs % 3600) / 60);
+	const s = Math.floor(secs % 60);
+	if (h > 0) {
+		return `${h}h ${m}m ${s}s`;
+	}
+	return `${m}m ${s}s`;
+};
+
+const getResolutionLabel = (w: number, h: number): string => {
+	if (w >= 3840 || h >= 2160) return '4K Ultra HD';
+	if (w >= 2560 || h >= 1440) return '2K QHD';
+	if (w >= 1920 || h >= 1080) return '1080p Full HD';
+	if (w >= 1280 || h >= 720) return '720p HD';
+	return 'SD';
 };
 
 const getFileIcon = (file: FileItem) => {
@@ -202,6 +221,11 @@ export const FilesPage: React.FC = () => {
 	// Image control state
 	const [imgZoom, setImgZoom] = useState<number>(1);
 	const [imgRotation, setImgRotation] = useState<number>(0);
+
+	// Video Cinema Modal and Metadata Detector States
+	const [showVideoModal, setShowVideoModal] = useState<boolean>(false);
+	const [videoModalFile, setVideoModalFile] = useState<FileItem | null>(null);
+	const [detectedMetadata, setDetectedMetadata] = useState<{ width: number; height: number; duration: number } | null>(null);
 
 	// Upload State
 	const [uploading, setUploading] = useState<boolean>(false);
@@ -571,6 +595,19 @@ export const FilesPage: React.FC = () => {
 			setImgRotation(0);
 		} else if (cat === 'video') {
 			setPreviewType('video');
+			setDetectedMetadata(null);
+			const videoUrl = `/api/files/stream?path=${encodeURIComponent(targetPath)}&token=${encodeURIComponent(token || '')}`;
+			const tempVideo = document.createElement('video');
+			tempVideo.src = videoUrl;
+			tempVideo.muted = true;
+			tempVideo.preload = 'metadata';
+			tempVideo.onloadedmetadata = () => {
+				setDetectedMetadata({
+					width: tempVideo.videoWidth,
+					height: tempVideo.videoHeight,
+					duration: tempVideo.duration
+				});
+			};
 		} else if (cat === 'code') {
 			setPreviewType('editor');
 			setEditorLang(getMonacoLanguage(file.extension));
@@ -597,6 +634,22 @@ export const FilesPage: React.FC = () => {
 		setPreviewFile(null);
 		setPreviewType(null);
 		setEditorContent('');
+		setDetectedMetadata(null);
+	};
+
+	const handleItemClick = (file: FileItem) => {
+		if (file.is_dir) {
+			navigateTo(file.name);
+		} else {
+			openPreview(file);
+		}
+	};
+
+	const handleItemDoubleClick = (file: FileItem) => {
+		if (!file.is_dir && getFileCategory(file.extension) === 'video') {
+			setVideoModalFile(file);
+			setShowVideoModal(true);
+		}
 	};
 
 	const handleSaveContent = async () => {
@@ -933,7 +986,8 @@ export const FilesPage: React.FC = () => {
 											height: 135,
 											transition: 'all 0.12s'
 										}}
-										onClick={() => file.is_dir ? navigateTo(file.name) : openPreview(file)}
+										onClick={() => handleItemClick(file)}
+										onDoubleClick={() => handleItemDoubleClick(file)}
 										className="file-card-hover"
 									>
 										{/* Selection Checkbox */}
@@ -995,7 +1049,8 @@ export const FilesPage: React.FC = () => {
 											cursor: 'pointer',
 											transition: 'all 0.12s'
 										}}
-										onClick={() => file.is_dir ? navigateTo(file.name) : openPreview(file)}
+										onClick={() => handleItemClick(file)}
+										onDoubleClick={() => handleItemDoubleClick(file)}
 										className="file-row-hover"
 									>
 										<input 
@@ -1140,46 +1195,77 @@ export const FilesPage: React.FC = () => {
 								</div>
 							)}
 
-							{/* Video Player */}
+							{/* Video Details Card (No Player in right box) */}
 							{previewType === 'video' && previewFile && (
-								<div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 10, overflow: 'hidden' }}>
-									<style>{`
-										.vjs-theme-vod-modal.video-js {
-											width: 100% !important;
-											height: 100% !important;
-										}
-										.vjs-theme-vod-modal .vjs-big-play-button {
-											background-color: var(--color-brand) !important;
-											border: none !important;
-											border-radius: 50% !important;
-											box-shadow: 0 4px 12px rgba(99,102,241,0.3) !important;
-										}
-									`}</style>
-									<div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+								<div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 14 }}>
+									<div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '16px 0', background: 'rgba(168,85,247,0.04)', borderRadius: 12, border: '1px dashed rgba(168,85,247,0.2)' }}>
+										<FiVideo size={48} style={{ color: '#a855f7', marginBottom: 10 }} />
 										<button 
-											className="btn btn--sm btn--primary" 
+											className="btn btn--primary" 
+											onClick={() => {
+												setVideoModalFile(previewFile);
+												setShowVideoModal(true);
+											}}
+											style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#a855f7', borderColor: '#a855f7' }}
+										>
+											<FiPlay size={14} fill="currentColor" /> Play in Cinema Mode
+										</button>
+										<span style={{ fontSize: 10, color: 'var(--color-brand-muted)', marginTop: 6 }}>
+											Or double-click the file to play
+										</span>
+									</div>
+
+									<div style={{ background: 'var(--color-brand-bg)', borderRadius: 8, padding: 14, border: '1px solid var(--color-brand-border)' }}>
+										<h4 style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-brand-muted)', textTransform: 'uppercase', marginBottom: 8, letterSpacing: '0.05em' }}>Video Specifications</h4>
+										<table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+											<tbody>
+												<tr style={{ borderBottom: '1px solid var(--color-brand-border)' }}>
+													<td style={{ padding: '6px 0', color: 'var(--color-brand-text)', fontWeight: 600 }}>Resolution</td>
+													<td style={{ padding: '6px 0', textAlign: 'right', color: 'var(--color-brand-heading)', fontWeight: 600 }}>
+														{detectedMetadata ? `${detectedMetadata.width} x ${detectedMetadata.height} (${getResolutionLabel(detectedMetadata.width, detectedMetadata.height)})` : 'Loading...'}
+													</td>
+												</tr>
+												<tr style={{ borderBottom: '1px solid var(--color-brand-border)' }}>
+													<td style={{ padding: '6px 0', color: 'var(--color-brand-text)', fontWeight: 600 }}>Duration</td>
+													<td style={{ padding: '6px 0', textAlign: 'right', color: 'var(--color-brand-heading)' }}>
+														{detectedMetadata ? formatDuration(detectedMetadata.duration) : 'Loading...'}
+													</td>
+												</tr>
+												<tr style={{ borderBottom: '1px solid var(--color-brand-border)' }}>
+													<td style={{ padding: '6px 0', color: 'var(--color-brand-text)', fontWeight: 600 }}>File Format</td>
+													<td style={{ padding: '6px 0', textAlign: 'right', color: 'var(--color-brand-heading)' }}>{previewFile.extension.toUpperCase()}</td>
+												</tr>
+												<tr style={{ borderBottom: '1px solid var(--color-brand-border)' }}>
+													<td style={{ padding: '6px 0', color: 'var(--color-brand-text)', fontWeight: 600 }}>File Size</td>
+													<td style={{ padding: '6px 0', textAlign: 'right', color: 'var(--color-brand-heading)' }}>{formatSize(previewFile.size)}</td>
+												</tr>
+												<tr>
+													<td style={{ padding: '6px 0', color: 'var(--color-brand-text)', fontWeight: 600 }}>Modified</td>
+													<td style={{ padding: '6px 0', textAlign: 'right', color: 'var(--color-brand-heading)' }}>{new Date(previewFile.mod_time).toLocaleString()}</td>
+												</tr>
+											</tbody>
+										</table>
+									</div>
+
+									<div style={{ display: 'flex', gap: 8 }}>
+										<a 
+											href={`/api/files/stream?path=${encodeURIComponent(currentPath === '/' ? `/${previewFile.name}` : `${currentPath}/${previewFile.name}`)}&download=true&token=${encodeURIComponent(token || '')}`} 
+											download
+											className="btn btn--primary"
+											style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}
+										>
+											<FiDownload size={14} /> Download File
+										</a>
+										<button 
+											className="btn" 
 											onClick={() => {
 												const targetPath = currentPath === '/' ? `/${previewFile.name}` : `${currentPath}/${previewFile.name}`;
-												window.open(`/player?path=${encodeURIComponent(targetPath)}`, '_blank');
+												window.open(`/api/files/stream?path=${encodeURIComponent(targetPath)}&download=true&token=${encodeURIComponent(token || '')}`, '_blank');
 											}}
 											style={{ display: 'flex', alignItems: 'center', gap: 6 }}
 										>
-											<FiMaximize2 size={13} /> Open in Cinema Mode (New Tab)
+											<FiExternalLink size={14} /> Direct URL
 										</button>
-									</div>
-									<div style={{ flex: 1, background: '#000', borderRadius: 8, overflow: 'hidden', position: 'relative' }}>
-										<VideoJSPlayer 
-											options={{
-												autoplay: true,
-												controls: true,
-												responsive: true,
-												fluid: false,
-												sources: [{
-													src: `/api/files/stream?path=${encodeURIComponent(currentPath === '/' ? `/${previewFile.name}` : `${currentPath}/${previewFile.name}`)}&token=${encodeURIComponent(token || '')}`,
-													type: 'video/mp4'
-												}]
-											}}
-										/>
 									</div>
 								</div>
 							)}
@@ -1638,6 +1724,72 @@ export const FilesPage: React.FC = () => {
 									</div>
 								);
 							})}
+						</div>
+					</div>
+				</div>
+			)}
+
+			{showVideoModal && videoModalFile && (
+				<div 
+					style={{ 
+						position: 'fixed', 
+						left: 0, 
+						top: 0, 
+						width: '100vw', 
+						height: '100vh', 
+						background: 'rgba(0,0,0,0.85)', 
+						backdropFilter: 'blur(8px)',
+						display: 'flex', 
+						alignItems: 'center', 
+						justifyContent: 'center', 
+						zIndex: 99999 
+					}}
+					onClick={() => setShowVideoModal(false)}
+				>
+					<div 
+						className="g-card animate-zoom-in" 
+						style={{ 
+							width: detectedMetadata ? Math.max(480, Math.min(window.innerWidth * 0.9, detectedMetadata.width / 2)) : 640,
+							height: detectedMetadata ? Math.max(360, Math.min(window.innerHeight * 0.9, detectedMetadata.height / 2 + 50)) : 410,
+							padding: 0, 
+							background: '#000',
+							border: '1px solid rgba(255,255,255,0.15)',
+							boxShadow: '0 25px 60px rgba(0,0,0,0.85)',
+							borderRadius: 12,
+							overflow: 'hidden',
+							display: 'flex',
+							flexDirection: 'column'
+						}}
+						onClick={(e) => e.stopPropagation()}
+					>
+						{/* Cinema Modal Header */}
+						<div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 16px', background: '#111', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+							<span style={{ fontSize: 13, fontWeight: 700, color: '#fff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '80%' }}>
+								Cinema Mode: {videoModalFile.name}
+							</span>
+							<button 
+								onClick={() => setShowVideoModal(false)} 
+								style={{ border: 'none', background: 'none', color: '#fff', cursor: 'pointer', padding: 4, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+							>
+								<FiX size={18} />
+							</button>
+						</div>
+
+						{/* VideoJS Container */}
+						<div style={{ flex: 1, position: 'relative', background: '#000' }}>
+							<VideoJSPlayer 
+								options={{
+									autoplay: true,
+									controls: true,
+									responsive: true,
+									fluid: false,
+									muted: true, // MUTE BY DEFAULT
+									sources: [{
+										src: `/api/files/stream?path=${encodeURIComponent(currentPath === '/' ? `/${videoModalFile.name}` : `${currentPath}/${videoModalFile.name}`)}&token=${encodeURIComponent(token || '')}`,
+										type: 'video/mp4'
+									}]
+								}}
+							/>
 						</div>
 					</div>
 				</div>
