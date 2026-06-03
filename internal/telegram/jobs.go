@@ -321,8 +321,8 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 			domain = strings.TrimSuffix(domain, "/")
 			absoluteDownloadURL = fmt.Sprintf("%s%s", domain, downloadPath)
 		} else {
-			// Fall back to localhost
-			absoluteDownloadURL = fmt.Sprintf("http://localhost:8080%s", downloadPath)
+			// Fall back to public domain
+			absoluteDownloadURL = fmt.Sprintf("https://ondata.ir%s", downloadPath)
 		}
 
 		logFn("INFO", "Assembling media post...")
@@ -361,23 +361,27 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 			mediaOption = doc
 		}
 
-		// Prepare inline keyboard with Direct Download URL button
-		kbMarkup := &tg.ReplyInlineMarkup{
-			Rows: []tg.KeyboardButtonRow{
-				{
-					Buttons: []tg.KeyboardButtonClass{
-						&tg.KeyboardButtonURL{
-							Text: "📥 Download Direct Link",
-							URL:  absoluteDownloadURL,
+		// Send media post — only attach download button if URL is a valid public HTTPS link
+		sender := message.NewSender(api)
+
+		if strings.HasPrefix(absoluteDownloadURL, "https://") {
+			kbMarkup := &tg.ReplyInlineMarkup{
+				Rows: []tg.KeyboardButtonRow{
+					{
+						Buttons: []tg.KeyboardButtonClass{
+							&tg.KeyboardButtonURL{
+								Text: "📥 Download Direct Link",
+								URL:  absoluteDownloadURL,
+							},
 						},
 					},
 				},
-			},
+			}
+			_, mediaSentErr = sender.To(peer).Markup(kbMarkup).Media(ctx, mediaOption)
+		} else {
+			_, mediaSentErr = sender.To(peer).Media(ctx, mediaOption)
 		}
 
-		// Send media post with inline keyboard markup
-		sender := message.NewSender(api)
-		_, mediaSentErr = sender.To(peer).Markup(kbMarkup).Media(ctx, mediaOption)
 		if mediaSentErr != nil {
 			return fmt.Errorf("failed to send media post: %w", mediaSentErr)
 		}
