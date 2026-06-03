@@ -1,0 +1,26 @@
+# MediaMTX Configuration File
+
+# RTSP is kept active on localhost only to receive the FFmpeg feed
+rtsp: yes
+rtspAddress: 127.0.0.1:8554
+
+# Disable unused streaming entrypoints
+rtmp: no
+api: no
+srt: no
+
+# Enable HLS and WebRTC endpoints
+hls: yes
+hlsAddress: 127.0.0.1:8888
+
+webrtc: yes
+webrtcAddress: 127.0.0.1:8889
+webrtcICEServers: [stun:stun.l.google.com:19302]
+
+paths:
+  # Dynamic Video on Demand path configuration
+  vod:
+    # Launch FFmpeg on demand when a stream client connects.
+    # Reads target file from sandboxed data manager root, and feeds original stream quality (codec copy)
+    runOnDemand: ffmpeg -re -i ./data/manager/$MTX_PATH -c:v copy -c:a copy -f rtsp rtsp://127.0.0.1:8554/vod/$MTX_PATH
+    runOnDemandCloseAfter: 10s

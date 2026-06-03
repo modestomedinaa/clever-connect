@@ -8,10 +8,12 @@ import (
 
 	"clever-connect/internal/config"
 	"clever-connect/internal/db"
+	"clever-connect/internal/downloader"
 	"clever-connect/internal/ehcocore"
 	"clever-connect/internal/handlers"
 	"clever-connect/internal/logger"
 	"clever-connect/internal/models"
+	"clever-connect/internal/torrent"
 
 	"github.com/gin-gonic/gin"
 )
@@ -38,6 +40,16 @@ func main() {
 	// Initialize Database
 	database := db.InitDB(cfg)
 	_ = database // keep reference
+
+	// Initialize Downloader Engine on server only
+	if cfg.AppMode == "server" {
+		downloader.Init()
+		if err := torrent.Init(); err != nil {
+			logger.Error("Torrent", "Failed to initialize torrent manager", "error", err)
+		} else {
+			defer torrent.Manager.Close()
+		}
+	}
 
 	// Auto-start active tunnel engine on bootstrap
 	if cfg.AppMode == "server" {
@@ -68,10 +80,15 @@ func main() {
 	router.Use(logger.GinRecoveryMiddleware())
 	router.Use(logger.GinMiddleware())
 
+	router.GET("/swagger", handlers.ServeSwagger)
+
 	// Setup API Route Handlers
 	authHandler := handlers.NewAuthHandler(cfg)
 	wsHandler := handlers.NewWSHandler(cfg)
 	ehcoHandler := handlers.NewEhcoHandler(cfg)
+	fileHandler := handlers.NewFileHandler(cfg)
+	leechHandler := handlers.NewLeechHandler(cfg)
+	torrentHandler := handlers.NewTorrentHandler(cfg)
 
 	// API Group
 	api := router.Group("/api")
@@ -98,6 +115,37 @@ func main() {
 
 			// System monitoring route
 			protected.GET("/system/stats", handlers.GetSystemStats)
+
+			// File Manager API Endpoints
+			protected.GET("/files/list", fileHandler.ListDirectory)
+			protected.GET("/files/stream", fileHandler.StreamOrDownload)
+			protected.GET("/files/content", fileHandler.GetContent)
+			protected.POST("/files/save", fileHandler.SaveContent)
+			protected.POST("/files/create-folder", fileHandler.CreateFolder)
+			protected.POST("/files/delete", fileHandler.DeleteItem)
+			protected.POST("/files/upload", fileHandler.UploadFile)
+			protected.POST("/files/move", fileHandler.MoveItem)
+			protected.POST("/files/copy", fileHandler.CopyItem)
+			protected.POST("/files/compress", fileHandler.CompressItems)
+			protected.POST("/files/decompress", fileHandler.DecompressItem)
+
+			// Remote Downloader (Leecher) API Endpoints
+			protected.GET("/leech/jobs", leechHandler.ListJobs)
+			protected.POST("/leech/add", leechHandler.AddJob)
+			protected.POST("/leech/pause", leechHandler.PauseJob)
+			protected.POST("/leech/start", leechHandler.StartJob)
+			protected.POST("/leech/delete", leechHandler.DeleteJob)
+			protected.GET("/leech/config", leechHandler.GetConfig)
+			protected.POST("/leech/config", leechHandler.SaveConfig)
+
+			// BitTorrent Client API Endpoints
+			protected.GET("/torrent/list", torrentHandler.ListTorrents)
+			protected.POST("/torrent/add", torrentHandler.AddTorrent)
+			protected.POST("/torrent/pause", torrentHandler.PauseTorrent)
+			protected.POST("/torrent/resume", torrentHandler.ResumeTorrent)
+			protected.POST("/torrent/delete", torrentHandler.DeleteTorrent)
+			protected.GET("/torrent/files", torrentHandler.ListTorrentFiles)
+			protected.POST("/torrent/select-files", torrentHandler.SelectTorrentFiles)
 		}
 	}
 
@@ -141,7 +189,7 @@ func serveEmbeddedSPA(embedFS fs.FS) gin.HandlerFunc {
 		path := c.Request.URL.Path
 
 		// If route matches API endpoints, continue to other middleware/handlers
-		if strings.HasPrefix(path, "/api") || strings.HasPrefix(path, "/ws") {
+		if strings.HasPrefix(path, "/api") || strings.HasPrefix(path, "/ws") || strings.HasPrefix(path, "/swagger") {
 			c.Next()
 			return
 		}

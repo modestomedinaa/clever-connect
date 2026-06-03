@@ -9,6 +9,10 @@ const DashboardPage = lazy(() => import('./pages/DashboardPage').then(m => ({ de
 const SettingsPage = lazy(() => import('./pages/SettingsPage').then(m => ({ default: m.SettingsPage })));
 const LogsPage = lazy(() => import('./pages/LogsPage').then(m => ({ default: m.LogsPage })));
 const EhcoClientPage = lazy(() => import('./pages/EhcoClientPage').then(m => ({ default: m.EhcoClientPage })));
+const FilesPage = lazy(() => import('./pages/FilesPage').then(m => ({ default: m.FilesPage })));
+const LeechPage = lazy(() => import('./pages/LeechPage').then(m => ({ default: m.LeechPage })));
+const PlayerPage = lazy(() => import('./pages/PlayerPage').then(m => ({ default: m.PlayerPage })));
+const TorrentPage = lazy(() => import('./pages/TorrentPage').then(m => ({ default: m.TorrentPage })));
 
 // Loading spinner
 const PageLoader = () => (
@@ -37,6 +41,9 @@ const ProtectedLayout: React.FC = () => {
     settings: ['Preferences', 'Settings'],
     'fw-logs': ['System Logs', 'Diagnostics'],
     'ehco-tunnel': ['Protocol', 'Ehco'],
+    files: ['Storage', 'Files Explorer'],
+    leech: ['Storage', 'Remote Leech Manager'],
+    torrent: ['Storage', 'Torrent Client'],
   };
 
   // Inject user local preferences (Font and Theme) on initial bootstrap
@@ -78,8 +85,16 @@ const LoginGuard: React.FC = () => {
   return <Suspense fallback={<PageLoader />}><LoginPage /></Suspense>;
 };
 
+const PlayerGuard: React.FC = () => {
+  const { isAuthenticated, initialize } = useAuthStore();
+  useEffect(() => { initialize(); }, [initialize]);
+  if (!isAuthenticated) return <Navigate to="/login" replace />;
+  return <Suspense fallback={<PageLoader />}><PlayerPage /></Suspense>;
+};
+
 const router = createBrowserRouter([
   { path: '/login', element: <LoginGuard /> },
+  { path: '/player', element: <PlayerGuard /> },
   {
     path: '/',
     element: <ProtectedLayout />,
@@ -89,6 +104,9 @@ const router = createBrowserRouter([
       { path: 'settings', element: <SettingsPage /> },
       { path: 'fw-logs', element: <LogsPage /> },
       { path: 'ehco-tunnel', element: <EhcoClientPage /> },
+      { path: 'files', element: <FilesPage /> },
+      { path: 'leech', element: <LeechPage /> },
+      { path: 'torrent', element: <TorrentPage /> },
     ],
   },
   { path: '*', element: <Navigate to="/dashboard" replace /> },

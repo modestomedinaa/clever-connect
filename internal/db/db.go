@@ -84,10 +84,22 @@ func InitDB(cfg *config.Config) *gorm.DB {
 
 	// Auto Migration
 	logger.Info("DB", "Executing automatic database schema migrations")
-	if err := DB.AutoMigrate(&models.User{}, &models.ClientSession{}, &models.EhcoServerConfig{}, &models.EhcoClientConfig{}); err != nil {
+	if err := DB.AutoMigrate(&models.User{}, &models.ClientSession{}, &models.EhcoServerConfig{}, &models.EhcoClientConfig{}, &models.LeechConfig{}, &models.LeechJob{}); err != nil {
 		logger.Fatal("DB", "Auto migration failed", "error", err)
 	}
 	logger.Info("DB", "Schema migrations completed successfully")
+
+	// Seed default LeechConfig
+	var leechCfg models.LeechConfig
+	if err := DB.First(&leechCfg).Error; err != nil {
+		logger.Info("DB", "Seeding default remote downloader configuration")
+		DB.Create(&models.LeechConfig{
+			DefaultSavePath: "./downloads",
+			MaxConcurrent:   3,
+			ThreadsPerJob:   8,
+			UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+		})
+	}
 
 	// Seed Admin User
 	seedAdmin(cfg)
