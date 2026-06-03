@@ -79,20 +79,7 @@ func (p *uploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 			speed = float64(state.Uploaded) / elapsed / (1024 * 1024) // MB/s
 		}
 
-		pBar := makeProgressBar(percent, 20)
-		progressText := fmt.Sprintf(
-			"📤 *Uploading File*\n\n"+
-				"📄 *File:* `%s`\n"+
-				"📏 *Uploaded:* %s of %s (%d%%)\n"+
-				"⚡ *Speed:* %.2f MB/s\n\n"+
-				"%s",
-			p.fileName,
-			formatFileSize(state.Uploaded),
-			formatFileSize(state.Total),
-			percent,
-			speed,
-			pBar,
-		)
+		progressText := formatUploadProgressText(p.fileName, state.Uploaded, state.Total, percent, speed, elapsed)
 
 		if p.progressMsg != nil && p.eng.Bot != nil {
 			btnRestart := tele.InlineButton{
@@ -195,9 +182,7 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 	// Send initial progress text message via the active telebot instance
 	var progressMsg *tele.Message
 	if eng.Bot != nil {
-		pBar := makeProgressBar(0, 20)
-		initialText := fmt.Sprintf("📤 *Starting Upload*\n\n📄 *File:* `%s`\n📏 *Size:* %s\n\n%s `0%%`",
-			fileName, formatFileSize(info.Size()), pBar)
+		initialText := formatUploadInitialText(fileName, info.Size())
 		
 		btnRestart := tele.InlineButton{
 			Text:   "🔄 Restart Job",
@@ -243,9 +228,7 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 
 	if eng.Bot == nil {
 		// User mode: send initial progress message via MTProto client
-		pBar := makeProgressBar(0, 20)
-		initialText := fmt.Sprintf("📤 *Starting Upload*\n\n📄 *File:* `%s`\n📏 *Size:* %s\n\n%s `0%%`",
-			fileName, formatFileSize(info.Size()), pBar)
+		initialText := formatUploadInitialText(fileName, info.Size())
 
 		sender := message.NewSender(api)
 		htmlText := mdToHTML(initialText)
@@ -504,13 +487,14 @@ func RunTelegramUploadJob(ctx context.Context, job *models.SchedulerJob, logFn f
 	if mediaSentErr != nil {
 		// Attempt to update the progress message with error
 		errMsg := fmt.Sprintf("failed to send media post: %v", mediaSentErr)
+		errorText := formatErrorText(true, fileName, errMsg)
 		if progressMsg != nil && eng.Bot != nil {
-			_, _ = eng.Bot.Edit(progressMsg, fmt.Sprintf("❌ *Upload Failed*\n\nReason: %s", errMsg), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+			_, _ = eng.Bot.Edit(progressMsg, errorText, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 		} else if pMsgID != 0 && pPeer != nil {
 			_, _ = api.MessagesEditMessage(eng.gotdCtx, &tg.MessagesEditMessageRequest{
 				Peer:    pPeer,
 				ID:      pMsgID,
-				Message: fmt.Sprintf("❌ <b>Upload Failed</b>\n\nReason: %s", errMsg),
+				Message: mdToHTML(errorText),
 			})
 		}
 		return fmt.Errorf("%s", errMsg)
@@ -823,16 +807,7 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 				absoluteDownloadURL = fmt.Sprintf("https://ondata.ir%s", downloadPath)
 			}
 
-			successText := fmt.Sprintf(
-				"✅ *Download Completed (Instant Deduplication)*\n\n"+
-					"📄 *File Name:* `%s`\n"+
-					"📏 *File Size:* `%s`\n"+
-					"📁 *Saved Path:* `%s`\n\n"+
-					"⚡ _Powered by CleverConnect Job Scheduler_",
-				fileName,
-				FormatFileSize(fileSize),
-				relPath,
-			)
+			successText := formatSuccessText(false, fileName, fileSize, relPath)
 
 			if eng.Bot != nil {
 				kb := &tele.ReplyMarkup{}
@@ -864,9 +839,7 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 	// 5. Send initial progress message
 	var progressMsg *tele.Message
 	var pMsgID int
-	pBar := makeProgressBar(0, 20)
-	initialText := fmt.Sprintf("📥 *Starting Download*\n\n📄 *File:* `%s`\n📏 *Size:* %s\n\n%s `0%%`",
-		fileName, FormatFileSize(fileSize), pBar)
+	initialText := formatDownloadInitialText(fileName, fileSize)
 
 	if eng.Bot != nil {
 		btnRestart := tele.InlineButton{
@@ -921,10 +894,23 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 	}
 
 	// 6. Download with progress callback
+	// Use a merged context: cancels if either the scheduler job ctx OR the engine ctx is cancelled.
+	// This ensures the scheduler can cancel downloads, and engine shutdown also stops them.
+	dlCtx, dlCancel := context.WithCancel(ctx)
+	defer dlCancel()
+	go func() {
+		select {
+		case <-eng.gotdCtx.Done():
+			dlCancel() // Engine shutting down
+		case <-dlCtx.Done():
+			// Already cancelled by scheduler or completion
+		}
+	}()
+
 	lastUpdate := time.Now()
 	startTime := time.Now()
 
-	err = FastDownloadFile(eng.gotdCtx, eng.gotdClient, fileLocation, safePath, fileSize, func(downloaded, total int64) {
+	err = FastDownloadFile(dlCtx, eng.gotdClient, fileLocation, safePath, fileSize, func(downloaded, total int64) {
 		percent := int(100 * float64(downloaded) / float64(total))
 		if percent > 100 {
 			percent = 100
@@ -944,20 +930,7 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 			if elapsed > 0 {
 				speed = float64(downloaded) / elapsed / (1024 * 1024) // MB/s
 			}
-			pBar := makeProgressBar(percent, 20)
-			progressText := fmt.Sprintf(
-				"📥 *Downloading File*\n\n"+
-					"📄 *File:* `%s`\n"+
-					"📏 *Downloaded:* %s of %s (%d%%)\n"+
-					"⚡ *Speed:* %.2f MB/s\n\n"+
-					"%s",
-				fileName,
-				FormatFileSize(downloaded),
-				FormatFileSize(total),
-				percent,
-				speed,
-				pBar,
-			)
+			progressText := formatDownloadProgressText(fileName, downloaded, total, percent, speed, elapsed)
 
 			if progressMsg != nil && eng.Bot != nil {
 				btnRestart := tele.InlineButton{
@@ -1000,13 +973,14 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 
 	if err != nil {
 		errMsg := fmt.Sprintf("Failed to download file: %v", err)
+		errorText := formatErrorText(false, fileName, errMsg)
 		if progressMsg != nil && eng.Bot != nil {
-			_, _ = eng.Bot.Edit(progressMsg, fmt.Sprintf("❌ *Download Failed*\n\nReason: %s", errMsg), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+			_, _ = eng.Bot.Edit(progressMsg, errorText, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 		} else if pMsgID != 0 {
 			_, _ = api.MessagesEditMessage(eng.gotdCtx, &tg.MessagesEditMessageRequest{
 				Peer:    peer,
 				ID:      pMsgID,
-				Message: fmt.Sprintf("❌ <b>Download Failed</b>\n\nReason: %s", errMsg),
+				Message: mdToHTML(errorText),
 			})
 		}
 		return err
@@ -1055,16 +1029,7 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 		absoluteDownloadURL = fmt.Sprintf("https://ondata.ir%s", downloadPath)
 	}
 
-	successText := fmt.Sprintf(
-		"✅ *Download Completed!*\n\n"+
-			"📄 *File Name:* `%s`\n"+
-			"📏 *File Size:* `%s`\n"+
-			"📁 *Saved Path:* `%s`\n\n"+
-			"⚡ _Powered by CleverConnect Job Scheduler_",
-		fileName,
-		FormatFileSize(fileSize),
-		relPath,
-	)
+	successText := formatSuccessText(false, fileName, fileSize, relPath)
 
 	logFn("INFO", "File downloaded successfully. Updating Telegram message with download link...")
 
@@ -1098,27 +1063,229 @@ func RunTelegramDownloadJob(ctx context.Context, job *models.SchedulerJob, logFn
 	return nil
 }
 
-// makeProgressBar creates a sleek visual progress bar
+// makeProgressBar creates a premium animated-style progress bar using Unicode block characters.
+// The bar uses a gradient fill with a cursor indicator for a modern look.
 func makeProgressBar(percent int, width int) string {
-	completed := percent * width / 100
-	if completed < 0 {
-		completed = 0
+	if percent < 0 {
+		percent = 0
 	}
+	if percent > 100 {
+		percent = 100
+	}
+
+	completed := percent * width / 100
 	if completed > width {
 		completed = width
 	}
 	remaining := width - completed
 
+	// Gradient fill characters for a colorful look
+	const (
+		fillChar  = "▓"
+		emptyChar = "░"
+		leftCap   = "▐"
+		rightCap  = "▌"
+	)
+
+	// Choose indicator emoji based on progress range
+	var indicator string
+	switch {
+	case percent >= 100:
+		indicator = "✅"
+	case percent >= 75:
+		indicator = "🟢"
+	case percent >= 50:
+		indicator = "🔵"
+	case percent >= 25:
+		indicator = "🟡"
+	default:
+		indicator = "🟠"
+	}
+
 	var sb strings.Builder
-	sb.WriteString("[")
+	sb.WriteString(indicator)
+	sb.WriteString(" ")
+	sb.WriteString(leftCap)
 	for i := 0; i < completed; i++ {
-		sb.WriteString("■")
+		sb.WriteString(fillChar)
 	}
 	for i := 0; i < remaining; i++ {
-		sb.WriteString("░")
+		sb.WriteString(emptyChar)
 	}
-	sb.WriteString("]")
+	sb.WriteString(rightCap)
+	sb.WriteString(fmt.Sprintf(" `%d%%`", percent))
 	return sb.String()
+}
+
+// formatETA calculates and formats the estimated time remaining.
+func formatETA(downloaded, total int64, elapsed float64) string {
+	if downloaded <= 0 || elapsed <= 0 {
+		return "calculating..."
+	}
+	speed := float64(downloaded) / elapsed
+	if speed <= 0 {
+		return "∞"
+	}
+	remaining := float64(total-downloaded) / speed
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	mins := int(remaining) / 60
+	secs := int(remaining) % 60
+	if mins > 60 {
+		hours := mins / 60
+		mins = mins % 60
+		return fmt.Sprintf("%dh %dm", hours, mins)
+	}
+	if mins > 0 {
+		return fmt.Sprintf("%dm %ds", mins, secs)
+	}
+	return fmt.Sprintf("%ds", secs)
+}
+
+// formatUploadProgressText builds the premium upload progress message.
+func formatUploadProgressText(fileName string, uploaded, total int64, percent int, speed float64, elapsed float64) string {
+	eta := formatETA(uploaded, total, elapsed)
+
+	return fmt.Sprintf(
+		"╔══════════════════════╗\n"+
+			"   📤  *UPLOADING FILE*\n"+
+			"╚══════════════════════╝\n\n"+
+			"📄 *File:* `%s`\n"+
+			"📦 *Size:* `%s`\n\n"+
+			"📊 *Progress:*\n"+
+			"%s\n"+
+			"💾 `%s` / `%s`\n\n"+
+			"⚡ *Speed:* `%.2f MB/s`\n"+
+			"⏱ *ETA:* `%s`\n\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━\n"+
+			"🔷 _CleverConnect Engine_",
+		fileName,
+		formatFileSize(total),
+		makeProgressBar(percent, 15),
+		formatFileSize(uploaded),
+		formatFileSize(total),
+		speed,
+		eta,
+	)
+}
+
+// formatDownloadProgressText builds the premium download progress message.
+func formatDownloadProgressText(fileName string, downloaded, total int64, percent int, speed float64, elapsed float64) string {
+	eta := formatETA(downloaded, total, elapsed)
+
+	return fmt.Sprintf(
+		"╔══════════════════════╗\n"+
+			"   📥  *DOWNLOADING FILE*\n"+
+			"╚══════════════════════╝\n\n"+
+			"📄 *File:* `%s`\n"+
+			"📦 *Size:* `%s`\n\n"+
+			"📊 *Progress:*\n"+
+			"%s\n"+
+			"💾 `%s` / `%s`\n\n"+
+			"⚡ *Speed:* `%.2f MB/s`\n"+
+			"⏱ *ETA:* `%s`\n\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━\n"+
+			"🔷 _CleverConnect Engine_",
+		fileName,
+		FormatFileSize(total),
+		makeProgressBar(percent, 15),
+		FormatFileSize(downloaded),
+		FormatFileSize(total),
+		speed,
+		eta,
+	)
+}
+
+// formatUploadInitialText builds the premium initial upload message.
+func formatUploadInitialText(fileName string, fileSize int64) string {
+	return fmt.Sprintf(
+		"╔══════════════════════╗\n"+
+			"   📤  *STARTING UPLOAD*\n"+
+			"╚══════════════════════╝\n\n"+
+			"📄 *File:* `%s`\n"+
+			"📦 *Size:* `%s`\n\n"+
+			"📊 *Progress:*\n"+
+			"%s\n\n"+
+			"⏳ _Initializing parallel transfer..._\n\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━\n"+
+			"🔷 _CleverConnect Engine_",
+		fileName,
+		formatFileSize(fileSize),
+		makeProgressBar(0, 15),
+	)
+}
+
+// formatDownloadInitialText builds the premium initial download message.
+func formatDownloadInitialText(fileName string, fileSize int64) string {
+	return fmt.Sprintf(
+		"╔══════════════════════╗\n"+
+			"   📥  *STARTING DOWNLOAD*\n"+
+			"╚══════════════════════╝\n\n"+
+			"📄 *File:* `%s`\n"+
+			"📦 *Size:* `%s`\n\n"+
+			"📊 *Progress:*\n"+
+			"%s\n\n"+
+			"⏳ _Initializing parallel transfer..._\n\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━\n"+
+			"🔷 _CleverConnect Engine_",
+		fileName,
+		FormatFileSize(fileSize),
+		makeProgressBar(0, 15),
+	)
+}
+
+// formatSuccessText builds the premium download/upload completion message.
+func formatSuccessText(isUpload bool, fileName string, fileSize int64, savedPath string) string {
+	icon := "📥"
+	action := "DOWNLOAD"
+	if isUpload {
+		icon = "📤"
+		action = "UPLOAD"
+	}
+
+	return fmt.Sprintf(
+		"╔══════════════════════╗\n"+
+			"   %s  *%s COMPLETE*\n"+
+			"╚══════════════════════╝\n\n"+
+			"✅ *Status:* `Success`\n\n"+
+			"📄 *File:* `%s`\n"+
+			"📦 *Size:* `%s`\n"+
+			"📁 *Path:* `%s`\n\n"+
+			"%s\n\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━\n"+
+			"🔷 _CleverConnect Engine_",
+		icon, action,
+		fileName,
+		FormatFileSize(fileSize),
+		savedPath,
+		makeProgressBar(100, 15),
+	)
+}
+
+// formatErrorText builds the premium error message.
+func formatErrorText(isUpload bool, fileName string, errMsg string) string {
+	icon := "📥"
+	action := "DOWNLOAD"
+	if isUpload {
+		icon = "📤"
+		action = "UPLOAD"
+	}
+
+	return fmt.Sprintf(
+		"╔══════════════════════╗\n"+
+			"   %s  *%s FAILED*\n"+
+			"╚══════════════════════╝\n\n"+
+			"❌ *Status:* `Error`\n\n"+
+			"📄 *File:* `%s`\n"+
+			"⚠️ *Reason:*\n`%s`\n\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━\n"+
+			"🔷 _CleverConnect Engine_",
+		icon, action,
+		fileName,
+		errMsg,
+	)
 }
 
 type ffprobeOutput struct {
