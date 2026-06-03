@@ -24,6 +24,7 @@ const navItems = [
     children: [
       { id: 'files', label: 'File manager' },
       { id: 'leech', label: 'Leech manager' },
+      { id: 'torrent', label: 'Torrent client' },
     ]
   },
   {

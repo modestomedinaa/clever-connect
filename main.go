@@ -13,6 +13,7 @@ import (
 	"clever-connect/internal/handlers"
 	"clever-connect/internal/logger"
 	"clever-connect/internal/models"
+	"clever-connect/internal/torrent"
 
 	"github.com/gin-gonic/gin"
 )
@@ -43,6 +44,11 @@ func main() {
 	// Initialize Downloader Engine on server only
 	if cfg.AppMode == "server" {
 		downloader.Init()
+		if err := torrent.Init(); err != nil {
+			logger.Error("Torrent", "Failed to initialize torrent manager", "error", err)
+		} else {
+			defer torrent.Manager.Close()
+		}
 	}
 
 	// Auto-start active tunnel engine on bootstrap
@@ -82,6 +88,7 @@ func main() {
 	ehcoHandler := handlers.NewEhcoHandler(cfg)
 	fileHandler := handlers.NewFileHandler(cfg)
 	leechHandler := handlers.NewLeechHandler(cfg)
+	torrentHandler := handlers.NewTorrentHandler(cfg)
 
 	// API Group
 	api := router.Group("/api")
@@ -130,6 +137,15 @@ func main() {
 			protected.POST("/leech/delete", leechHandler.DeleteJob)
 			protected.GET("/leech/config", leechHandler.GetConfig)
 			protected.POST("/leech/config", leechHandler.SaveConfig)
+
+			// BitTorrent Client API Endpoints
+			protected.GET("/torrent/list", torrentHandler.ListTorrents)
+			protected.POST("/torrent/add", torrentHandler.AddTorrent)
+			protected.POST("/torrent/pause", torrentHandler.PauseTorrent)
+			protected.POST("/torrent/resume", torrentHandler.ResumeTorrent)
+			protected.POST("/torrent/delete", torrentHandler.DeleteTorrent)
+			protected.GET("/torrent/files", torrentHandler.ListTorrentFiles)
+			protected.POST("/torrent/select-files", torrentHandler.SelectTorrentFiles)
 		}
 	}
 

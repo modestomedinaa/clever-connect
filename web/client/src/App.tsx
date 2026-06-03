@@ -12,6 +12,7 @@ const EhcoClientPage = lazy(() => import('./pages/EhcoClientPage').then(m => ({ 
 const FilesPage = lazy(() => import('./pages/FilesPage').then(m => ({ default: m.FilesPage })));
 const LeechPage = lazy(() => import('./pages/LeechPage').then(m => ({ default: m.LeechPage })));
 const PlayerPage = lazy(() => import('./pages/PlayerPage').then(m => ({ default: m.PlayerPage })));
+const TorrentPage = lazy(() => import('./pages/TorrentPage').then(m => ({ default: m.TorrentPage })));
 
 // Loading spinner
 const PageLoader = () => (
@@ -42,6 +43,7 @@ const ProtectedLayout: React.FC = () => {
     'ehco-tunnel': ['Protocol', 'Ehco'],
     files: ['Storage', 'Files Explorer'],
     leech: ['Storage', 'Remote Leech Manager'],
+    torrent: ['Storage', 'Torrent Client'],
   };
 
   // Inject user local preferences (Font and Theme) on initial bootstrap
@@ -104,6 +106,7 @@ const router = createBrowserRouter([
       { path: 'ehco-tunnel', element: <EhcoClientPage /> },
       { path: 'files', element: <FilesPage /> },
       { path: 'leech', element: <LeechPage /> },
+      { path: 'torrent', element: <TorrentPage /> },
     ],
   },
   { path: '*', element: <Navigate to="/dashboard" replace /> },

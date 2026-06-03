@@ -32,11 +32,11 @@ RUN mkdir -p web/client/dist && touch web/client/dist/index.html
 COPY . .
 
 # Compile Go backend binary with embedded SPA assets
-RUN go build -o bin/clever-connect main.go
+RUN go build --ldflags '-extldflags "-Wl,--allow-multiple-definition"' -o bin/clever-connect main.go
 
 # Populate go.sum dependencies and compile Ehco
 RUN go get github.com/Ehco1996/ehco/cmd/ehco && \
-    go build -o bin/ehco github.com/Ehco1996/ehco/cmd/ehco
+    go build --ldflags '-extldflags "-Wl,--allow-multiple-definition"' -o bin/ehco github.com/Ehco1996/ehco/cmd/ehco
 
 # ==========================================
 # STAGE 3: MINIMAL RUNTIME CONTAINER

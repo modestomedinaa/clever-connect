@@ -89,3 +89,23 @@ type LeechJob struct {
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
+// TorrentJob tracks BitTorrent tasks
+type TorrentJob struct {
+	InfoHash      string    `gorm:"primaryKey" json:"info_hash"`
+	Name          string    `json:"name"`
+	MagnetURI     string    `gorm:"type:text" json:"magnet_uri"`
+	TorrentPath   string    `json:"torrent_path"` // Local path to saved .torrent
+	SaveDirectory string    `json:"save_directory"`
+	Status        string    `json:"status" gorm:"default:'downloading'"` // downloading, paused, completed, seeding, error
+	TotalBytes    int64     `json:"total_bytes"`
+	Downloaded    int64     `json:"downloaded"`
+	Uploaded      int64     `json:"uploaded"`
+	Progress      float64   `json:"progress"`
+	DownloadSpeed float64   `json:"download_speed"` // MB/s
+	UploadSpeed   float64   `json:"upload_speed"`   // MB/s
+	Peers         int       `json:"peers"`
+	ErrorMessage  string    `json:"error_message"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
