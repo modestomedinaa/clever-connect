@@ -22,6 +22,7 @@ const navItems = [
       { id: 'files', label: 'File manager' },
       { id: 'leech', label: 'Leech manager' },
       { id: 'torrent', label: 'Torrent client' },
+      { id: 'youtube', label: 'YouTube downloader' },
     ]
   },
   { id: 'fw-logs', label: 'System Logs', icon: FiShield },

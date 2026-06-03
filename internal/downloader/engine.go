@@ -353,12 +353,9 @@ func (e *Engine) monitorProgress(resp *grab.Response, jobID string, ctx context.
 
 // resolvePremiumURL follows premium.to redirects and parses response links and filenames
 func resolvePremiumURL(apiURL string, client *http.Client) (string, string, error) {
-	req, err := http.NewRequest("GET", apiURL, nil)
-	if err != nil {
-		return "", "", err
-	}
+	currentURL := apiURL
+	var finalFilename string
 
-	// Disable automatic redirect following to capture Location header
 	noRedirectClient := &http.Client{
 		Transport: client.Transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -367,65 +364,111 @@ func resolvePremiumURL(apiURL string, client *http.Client) (string, string, erro
 		Timeout: 15 * time.Second,
 	}
 
-	resp, err := noRedirectClient.Do(req)
-	if err != nil {
-		return "", "", err
-	}
-	defer resp.Body.Close()
+	// Limit to maximum 10 redirects to prevent infinite loops
+	for i := 0; i < 10; i++ {
+		req, err := http.NewRequest("GET", currentURL, nil)
+		if err != nil {
+			return "", "", err
+		}
 
-	if resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusTemporaryRedirect || resp.StatusCode == http.StatusSeeOther {
-		loc := resp.Header.Get("Location")
-		if loc != "" {
-			filename := ""
-			if disp := resp.Header.Get("Content-Disposition"); disp != "" {
-				filename = parseContentDispositionFilename(disp)
+		resp, err := noRedirectClient.Do(req)
+		if err != nil {
+			return "", "", err
+		}
+
+		// Capture Content-Disposition if present
+		if disp := resp.Header.Get("Content-Disposition"); disp != "" {
+			if fn := parseContentDispositionFilename(disp); fn != "" {
+				finalFilename = fn
 			}
-			if filename == "" {
-				parsed, err := url.Parse(loc)
+		}
+
+		isRedirect := resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusMovedPermanently || 
+			resp.StatusCode == http.StatusTemporaryRedirect || resp.StatusCode == http.StatusSeeOther || 
+			resp.StatusCode == 308
+
+		if isRedirect {
+			resp.Body.Close()
+			loc := resp.Header.Get("Location")
+			if loc != "" {
+				// Resolve relative URLs relative to currentURL
+				base, err := url.Parse(currentURL)
 				if err == nil {
-					filename = filepath.Base(parsed.Path)
+					locURL, err := base.Parse(loc)
+					if err == nil {
+						currentURL = locURL.String()
+					} else {
+						currentURL = loc
+					}
+				} else {
+					currentURL = loc
+				}
+				continue
+			}
+			break
+		}
+
+		// If it's the first request, we need to handle plain text URL or JSON error in body
+		if i == 0 {
+			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			bodyStr := strings.TrimSpace(string(bodyBytes))
+
+			if strings.HasPrefix(bodyStr, "{") {
+				if strings.Contains(bodyStr, "\"error\"") || strings.Contains(bodyStr, "\"err\"") {
+					return "", "", fmt.Errorf("premium.to error response: %s", bodyStr)
 				}
 			}
-			return loc, filename, nil
+
+			if strings.HasPrefix(bodyStr, "http://") || strings.HasPrefix(bodyStr, "https://") {
+				currentURL = bodyStr
+				continue
+			}
+		} else {
+			resp.Body.Close()
 		}
+
+		// If we reach here and it was not a redirect (and not a URL in body of the first request), we are done.
+		break
 	}
 
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	bodyStr := strings.TrimSpace(string(bodyBytes))
-
-	if strings.HasPrefix(bodyStr, "{") {
-		if strings.Contains(bodyStr, "\"error\"") || strings.Contains(bodyStr, "\"err\"") {
-			return "", "", fmt.Errorf("premium.to error response: %s", bodyStr)
-		}
-	}
-
-	if strings.HasPrefix(bodyStr, "http://") || strings.HasPrefix(bodyStr, "https://") {
-		filename := ""
-		parsed, err := url.Parse(bodyStr)
+	// If filename is still empty, parse from final URL path
+	if finalFilename == "" {
+		parsed, err := url.Parse(currentURL)
 		if err == nil {
-			filename = filepath.Base(parsed.Path)
+			finalFilename = filepath.Base(parsed.Path)
 		}
-		return bodyStr, filename, nil
 	}
 
-	filename := ""
-	if disp := resp.Header.Get("Content-Disposition"); disp != "" {
-		filename = parseContentDispositionFilename(disp)
-	}
-	return apiURL, filename, nil
+	return currentURL, finalFilename, nil
 }
 
 func parseContentDispositionFilename(disp string) string {
 	parts := strings.Split(disp, ";")
+	var filename string
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
-		if strings.HasPrefix(part, "filename=") {
-			filename := strings.TrimPrefix(part, "filename=")
-			filename = strings.Trim(filename, "\"")
-			return filename
+		if strings.HasPrefix(part, "filename*=") {
+			val := strings.TrimPrefix(part, "filename*=")
+			val = strings.Trim(val, "\"")
+			subParts := strings.SplitN(val, "'", 3)
+			if len(subParts) == 3 {
+				decoded, err := url.PathUnescape(subParts[2])
+				if err == nil {
+					return decoded
+				}
+			} else {
+				decoded, err := url.PathUnescape(val)
+				if err == nil {
+					return decoded
+				}
+			}
+		} else if strings.HasPrefix(part, "filename=") {
+			val := strings.TrimPrefix(part, "filename=")
+			filename = strings.Trim(val, "\"")
 		}
 	}
-	return ""
+	return filename
 }
 
 // startQueueWorker runs a queue tick loop checking for pending downloads

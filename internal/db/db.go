@@ -88,7 +88,7 @@ func InitDB(cfg *config.Config) *gorm.DB {
 	if DB.Dialector.Name() == "mysql" {
 		migrateDB = DB.Set("gorm:table_options", "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci")
 	}
-	if err := migrateDB.AutoMigrate(&models.User{}, &models.ClientSession{}, &models.EhcoServerConfig{}, &models.EhcoClientConfig{}, &models.LeechConfig{}, &models.LeechJob{}, &models.TelegramConfig{}, &models.SchedulerJob{}, &models.SchedulerJobLog{}, &models.SchedulerConfig{}, &models.TelegramSubscriber{}); err != nil {
+	if err := migrateDB.AutoMigrate(&models.User{}, &models.ClientSession{}, &models.EhcoServerConfig{}, &models.EhcoClientConfig{}, &models.LeechConfig{}, &models.LeechJob{}, &models.TelegramConfig{}, &models.SchedulerJob{}, &models.SchedulerJobLog{}, &models.SchedulerConfig{}, &models.TelegramSubscriber{}, &models.YouTubeJob{}, &models.YouTubeConfig{}); err != nil {
 		logger.Fatal("DB", "Auto migration failed", "error", err)
 	}
 	
@@ -123,6 +123,16 @@ func InitDB(cfg *config.Config) *gorm.DB {
 			PurgeAfterDays:      30,
 			EnableCronJobs:      true,
 			EnableNotifications: false,
+		})
+	}
+
+	// Seed default YouTubeConfig
+	var ytCfg models.YouTubeConfig
+	if err := DB.First(&ytCfg).Error; err != nil {
+		logger.Info("DB", "Seeding default YouTube downloader configuration")
+		DB.Create(&models.YouTubeConfig{
+			DefaultSavePath: "./downloads/youtube",
+			MaxConcurrent:   2,
 		})
 	}
 

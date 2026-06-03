@@ -14,6 +14,7 @@ import (
 	"clever-connect/internal/logger"
 	"clever-connect/internal/models"
 	"clever-connect/internal/torrent"
+	"clever-connect/internal/youtube"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -313,6 +314,14 @@ func (h *WSHandler) ServeWSJobs(c *gin.Context) {
 				if cmd.JobID != "" && downloader.Manager != nil {
 					downloader.Manager.DeleteJob(cmd.JobID, cmd.DeleteFiles)
 				}
+			case "cancel_youtube":
+				if cmd.JobID != "" && youtube.Manager != nil {
+					youtube.Manager.PauseJob(cmd.JobID)
+				}
+			case "delete_youtube":
+				if cmd.JobID != "" && youtube.Manager != nil {
+					youtube.Manager.DeleteJob(cmd.JobID, cmd.DeleteFiles)
+				}
 			}
 		}
 	}()
@@ -326,14 +335,17 @@ func (h *WSHandler) ServeWSJobs(c *gin.Context) {
 		case <-ticker.C:
 			var torrentList []models.TorrentJob
 			var leechList []models.LeechJob
+			var youtubeList []models.YouTubeJob
 
 			// Fetch lists from database
 			_ = db.DB.Order("created_at desc").Find(&torrentList)
 			_ = db.DB.Order("created_at desc").Find(&leechList)
+			_ = db.DB.Order("created_at desc").Find(&youtubeList)
 
 			response := gin.H{
-				"torrents":   torrentList,
-				"leechJobs":  leechList,
+				"torrents":    torrentList,
+				"leechJobs":   leechList,
+				"youtubeJobs": youtubeList,
 			}
 
 			if err := conn.WriteJSON(response); err != nil {

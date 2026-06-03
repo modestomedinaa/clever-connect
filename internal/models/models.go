@@ -209,3 +209,43 @@ type TelegramSubscriber struct {
 	FirstName string `json:"first_name"`
 	Active    bool   `gorm:"default:true" json:"active"`
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// YouTube Downloader Models
+// ──────────────────────────────────────────────────────────────────────────────
+
+// YouTubeJob tracks individual YouTube video download tasks
+type YouTubeJob struct {
+	ID               string    `gorm:"primaryKey" json:"id"`
+	VideoURL         string    `gorm:"type:text;not null" json:"video_url"`
+	VideoID          string    `json:"video_id"`
+	Title            string    `gorm:"type:text" json:"title"`
+	Author           string    `json:"author"`
+	Duration         string    `json:"duration"` // Human-readable duration
+	DurationSeconds  int64     `json:"duration_seconds"`
+	Thumbnail        string    `gorm:"type:text" json:"thumbnail"`
+	Filename         string    `json:"filename"`
+	SaveDirectory    string    `json:"save_directory"`
+	SelectedITag     int       `json:"selected_itag"`
+	QualityLabel     string    `json:"quality_label"` // e.g., "1080p", "720p", "360p"
+	MimeType         string    `json:"mime_type"`
+	TotalBytes       int64     `json:"total_bytes"`
+	Downloaded       int64     `json:"downloaded"`
+	Status           string    `json:"status" gorm:"default:'pending'"` // pending, fetching, downloading, converting, completed, error
+	Progress         float64   `json:"progress"`                        // 0.0 to 100.0
+	ConvertProgress  float64   `json:"convert_progress"`                // 0.0 to 100.0 (TV conversion progress)
+	Speed            float64   `json:"speed"`                           // MB/s
+	ConvertToTV      bool      `json:"convert_to_tv" gorm:"default:false"`
+	ConvertStatus    string    `json:"convert_status"` // "", "queued", "converting", "completed", "error"
+	ErrorMessage     string    `json:"error_message"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+// YouTubeConfig stores default configurations for YouTube downloads
+type YouTubeConfig struct {
+	gorm.Model
+	DefaultSavePath string `json:"default_save_path" gorm:"default:'./downloads/youtube'"`
+	MaxConcurrent   int    `json:"max_concurrent" gorm:"default:2"`
+	ProxyURL        string `json:"proxy_url"`
+}

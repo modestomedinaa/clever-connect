@@ -35,9 +35,37 @@ export interface LeechJob {
   updated_at: string;
 }
 
+export interface YouTubeJob {
+  id: string;
+  video_url: string;
+  video_id: string;
+  title: string;
+  author: string;
+  duration: string;
+  duration_seconds: number;
+  thumbnail: string;
+  filename: string;
+  save_directory: string;
+  selected_itag: number;
+  quality_label: string;
+  mime_type: string;
+  total_bytes: number;
+  downloaded: number;
+  status: 'pending' | 'fetching' | 'downloading' | 'converting' | 'completed' | 'error';
+  progress: number;
+  convert_progress: number;
+  speed: number;
+  convert_to_tv: boolean;
+  convert_status: string;
+  error_message: string;
+  created_at: string;
+  updated_at: string;
+}
+
 interface JobsState {
   torrents: TorrentJob[];
   leechJobs: LeechJob[];
+  youtubeJobs: YouTubeJob[];
   wsConnected: boolean;
   initWebSocket: (token: string) => () => void;
   sendAction: (cmd: { action: string; info_hash?: string; job_id?: string; delete_files?: boolean }) => void;
@@ -50,6 +78,7 @@ export const useJobsStore = create<JobsState>((set, get) => {
   return {
     torrents: [],
     leechJobs: [],
+    youtubeJobs: [],
     wsConnected: false,
 
     initWebSocket: (token) => {
@@ -69,7 +98,8 @@ export const useJobsStore = create<JobsState>((set, get) => {
               const data = JSON.parse(event.data);
               set({
                 torrents: data.torrents || [],
-                leechJobs: data.leechJobs || []
+                leechJobs: data.leechJobs || [],
+                youtubeJobs: data.youtubeJobs || []
               });
             } catch (err) {
               console.error('Failed to parse jobs WS data', err);

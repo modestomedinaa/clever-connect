@@ -16,6 +16,7 @@ import (
 	"clever-connect/internal/scheduler"
 	"clever-connect/internal/telegram"
 	"clever-connect/internal/torrent"
+	"clever-connect/internal/youtube"
 
 	"github.com/gin-gonic/gin"
 )
@@ -51,6 +52,9 @@ func main() {
 		} else {
 			defer torrent.Manager.Close()
 		}
+
+		// Initialize YouTube Download Engine
+		youtube.Init()
 
 		// Initialize Enterprise Job Scheduler Engine
 		scheduler.Init()
@@ -105,6 +109,7 @@ func main() {
 	fileHandler := handlers.NewFileHandler(cfg)
 	leechHandler := handlers.NewLeechHandler(cfg)
 	torrentHandler := handlers.NewTorrentHandler(cfg)
+	youtubeHandler := handlers.NewYouTubeHandler(cfg)
 	telegramHandler := handlers.NewTelegramHandler(cfg)
 	schedulerHandler := handlers.NewSchedulerHandler(cfg)
 
@@ -166,6 +171,15 @@ func main() {
 			protected.POST("/torrent/select-files", torrentHandler.SelectTorrentFiles)
 			protected.GET("/torrent/config", torrentHandler.GetConfig)
 			protected.POST("/torrent/config", torrentHandler.SaveConfig)
+
+			// YouTube Downloader API Endpoints
+			protected.POST("/youtube/info", youtubeHandler.FetchInfo)
+			protected.POST("/youtube/add", youtubeHandler.AddJob)
+			protected.GET("/youtube/jobs", youtubeHandler.ListJobs)
+			protected.POST("/youtube/cancel", youtubeHandler.CancelJob)
+			protected.POST("/youtube/delete", youtubeHandler.DeleteJob)
+			protected.GET("/youtube/config", youtubeHandler.GetConfig)
+			protected.POST("/youtube/config", youtubeHandler.SaveConfig)
 
 			// Telegram Bot Core API Endpoints
 			protected.GET("/telegram/config", telegramHandler.GetConfig)
