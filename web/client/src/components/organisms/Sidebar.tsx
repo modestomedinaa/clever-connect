@@ -1,5 +1,5 @@
 import React from 'react';
-import { FiGrid, FiLayers, FiGlobe, FiRepeat, FiShield, FiTrendingUp, FiUsers, FiSettings, FiBook, FiHelpCircle, FiLogOut, FiSearch, FiZap, FiMenu, FiCpu, FiFolder } from 'react-icons/fi';
+import { FiGrid, FiLayers, FiGlobe, FiRepeat, FiShield, FiTrendingUp, FiUsers, FiSettings, FiBook, FiHelpCircle, FiLogOut, FiSearch, FiZap, FiMenu, FiCpu, FiFolder, FiSend } from 'react-icons/fi';
 
 interface SidebarProps {
   activeTab: string;
@@ -36,7 +36,13 @@ const navItems = [
   },
   { id: 'analytics', label: 'Analytics', icon: FiTrendingUp },
   { id: 'team', label: 'Team', icon: FiUsers },
-  { id: 'settings', label: 'Settings', icon: FiSettings },
+  {
+    id: 'settings-section', label: 'Settings', icon: FiSettings,
+    children: [
+      { id: 'settings', label: 'App settings' },
+      { id: 'telegram-settings', label: 'Telegram' },
+    ]
+  },
 ];
 
 export const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab, isCollapsed, setIsCollapsed }) => {

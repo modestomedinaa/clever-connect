@@ -13,6 +13,7 @@ import (
 	"clever-connect/internal/handlers"
 	"clever-connect/internal/logger"
 	"clever-connect/internal/models"
+	"clever-connect/internal/telegram"
 	"clever-connect/internal/torrent"
 
 	"github.com/gin-gonic/gin"
@@ -70,6 +71,17 @@ func main() {
 		}
 	}
 
+	// Auto-start Telegram bot engine if configured and active
+	if cfg.AppMode == "server" {
+		var telegramCfg models.TelegramConfig
+		if err := db.DB.First(&telegramCfg).Error; err == nil && telegramCfg.IsActive && telegramCfg.BotToken != "" {
+			logger.Info("Telegram", "Auto-starting Telegram bot engine")
+			if err := telegram.StartEngine(&telegramCfg); err != nil {
+				logger.Error("Telegram", "Failed to auto-start Telegram bot", "error", err)
+			}
+		}
+	}
+
 	// Setup Gin Router in release mode
 	gin.SetMode(gin.ReleaseMode)
 	gin.DefaultWriter = logger.GinWriter()
@@ -89,6 +101,7 @@ func main() {
 	fileHandler := handlers.NewFileHandler(cfg)
 	leechHandler := handlers.NewLeechHandler(cfg)
 	torrentHandler := handlers.NewTorrentHandler(cfg)
+	telegramHandler := handlers.NewTelegramHandler(cfg)
 
 	// API Group
 	api := router.Group("/api")
@@ -146,6 +159,15 @@ func main() {
 			protected.POST("/torrent/delete", torrentHandler.DeleteTorrent)
 			protected.GET("/torrent/files", torrentHandler.ListTorrentFiles)
 			protected.POST("/torrent/select-files", torrentHandler.SelectTorrentFiles)
+
+			// Telegram Bot Core API Endpoints
+			protected.GET("/telegram/config", telegramHandler.GetConfig)
+			protected.POST("/telegram/config", telegramHandler.SaveConfig)
+			protected.POST("/telegram/test", telegramHandler.TestConnection)
+			protected.POST("/telegram/start", telegramHandler.StartBot)
+			protected.POST("/telegram/stop", telegramHandler.StopBot)
+			protected.GET("/telegram/status", telegramHandler.GetStatus)
+			protected.POST("/telegram/send-file", telegramHandler.SendFile)
 		}
 	}
 

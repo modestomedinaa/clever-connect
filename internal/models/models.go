@@ -109,3 +109,17 @@ type TorrentJob struct {
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
+// TelegramConfig stores the Telegram bot configuration, persisted in the database.
+// All settings are configurable from the admin panel and the REST API.
+type TelegramConfig struct {
+	gorm.Model
+	BotToken            string `json:"bot_token" gorm:"type:text"`
+	AdminUserIDs        string `json:"admin_user_ids" gorm:"type:text"`                // Comma-separated Telegram user IDs
+	WelcomeMessage      string `json:"welcome_message" gorm:"type:text"`
+	PollingInterval     int    `json:"polling_interval" gorm:"default:10"`              // Seconds between long-poll cycles
+	MaxFileSize         int    `json:"max_file_size" gorm:"default:50"`                 // Maximum file size in MB
+	EnableFileSharing   bool   `json:"enable_file_sharing" gorm:"default:true"`
+	EnableNotifications bool   `json:"enable_notifications" gorm:"default:true"`
+	IsActive            bool   `json:"is_active" gorm:"default:false"`                  // Whether the bot should auto-start
+}
+
