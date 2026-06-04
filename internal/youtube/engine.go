@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +23,52 @@ import (
 
 	ytdl "github.com/kkdai/youtube/v2"
 )
+
+type UserAgentRoundTripper struct {
+	Transport http.RoundTripper
+	UserAgent string
+}
+
+func (urt *UserAgentRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	ua := req.Header.Get("User-Agent")
+	if ua == "" || !strings.HasPrefix(ua, "Mozilla") {
+		req.Header.Set("User-Agent", urt.UserAgent)
+	}
+	if req.Header.Get("Accept-Language") == "" {
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	}
+	return urt.Transport.RoundTrip(req)
+}
+
+func getYouTubeHTTPClientWithProxy() *http.Client {
+	var proxyURL string
+
+	var ytCfg models.YouTubeConfig
+	if err := db.DB.First(&ytCfg).Error; err == nil && ytCfg.ProxyURL != "" {
+		proxyURL = ytCfg.ProxyURL
+	}
+
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+	}
+
+	if proxyURL != "" {
+		if proxyURI, err := url.Parse(proxyURL); err == nil {
+			transport.Proxy = http.ProxyURL(proxyURI)
+			logger.Info("YouTube", "Using configured proxy for YouTube request", "url", proxyURL)
+		} else {
+			logger.Error("YouTube", "Invalid proxy URL configured", "url", proxyURL, "error", err)
+		}
+	}
+
+	return &http.Client{
+		Transport: &UserAgentRoundTripper{
+			Transport: transport,
+			UserAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		},
+		Timeout: 30 * time.Second,
+	}
+}
 
 var (
 	Manager  *Engine
@@ -106,6 +154,7 @@ func (e *Engine) Close() {
 
 // FetchVideoInfo retrieves video metadata and available formats from YouTube
 func (e *Engine) FetchVideoInfo(videoURL string) (*VideoInfo, error) {
+	e.client.HTTPClient = getYouTubeHTTPClientWithProxy()
 	video, err := e.client.GetVideo(videoURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch video info: %w", err)
@@ -249,6 +298,9 @@ func (e *Engine) executeDownload(ctx context.Context, job *models.YouTubeJob) {
 
 	// Update status to downloading
 	db.DB.Model(&models.YouTubeJob{}).Where("id = ?", job.ID).Update("status", "downloading")
+
+	// Set HTTP Client with proxy dynamically
+	e.client.HTTPClient = getYouTubeHTTPClientWithProxy()
 
 	// Fetch video info
 	video, err := e.client.GetVideoContext(ctx, job.VideoURL)

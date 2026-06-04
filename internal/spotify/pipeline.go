@@ -24,6 +24,59 @@ import (
 	ytdl "github.com/kkdai/youtube/v2"
 )
 
+type UserAgentRoundTripper struct {
+	Transport http.RoundTripper
+	UserAgent string
+}
+
+func (urt *UserAgentRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	ua := req.Header.Get("User-Agent")
+	if ua == "" || !strings.HasPrefix(ua, "Mozilla") {
+		req.Header.Set("User-Agent", urt.UserAgent)
+	}
+	if req.Header.Get("Accept-Language") == "" {
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	}
+	return urt.Transport.RoundTrip(req)
+}
+
+func getHTTPClientWithProxy() *http.Client {
+	var proxyURL string
+
+	var spotifyCfg models.SpotifyConfig
+	if err := db.DB.First(&spotifyCfg).Error; err == nil && spotifyCfg.ProxyURL != "" {
+		proxyURL = spotifyCfg.ProxyURL
+	}
+
+	if proxyURL == "" {
+		var ytCfg models.YouTubeConfig
+		if err := db.DB.First(&ytCfg).Error; err == nil && ytCfg.ProxyURL != "" {
+			proxyURL = ytCfg.ProxyURL
+		}
+	}
+
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+	}
+
+	if proxyURL != "" {
+		if proxyURI, err := url.Parse(proxyURL); err == nil {
+			transport.Proxy = http.ProxyURL(proxyURI)
+			logger.Info("Spotify", "Using configured proxy for YouTube request", "url", proxyURL)
+		} else {
+			logger.Error("Spotify", "Invalid proxy URL configured", "url", proxyURL, "error", err)
+		}
+	}
+
+	return &http.Client{
+		Transport: &UserAgentRoundTripper{
+			Transport: transport,
+			UserAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		},
+		Timeout: 30 * time.Second,
+	}
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Download Pipeline — YT Music Matching → Raw Download → FFmpeg Transcode → ID3 Tag
 // Replicates the spotDL algorithm: Spotify metadata + YouTube audio + FFmpeg conversion
@@ -81,7 +134,7 @@ func searchYouTubeInnerTube(ctx context.Context, query string) (string, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := getHTTPClientWithProxy()
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -121,7 +174,7 @@ func searchYouTubeHTML(ctx context.Context, query string) (string, error) {
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := getHTTPClientWithProxy()
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -187,7 +240,9 @@ func matchYouTube(ctx context.Context, track *TrackMeta) (string, error) {
 
 // downloadRawAudio downloads the best audio stream from YouTube into a temp file
 func downloadRawAudio(ctx context.Context, jobID, ytURL, tempDir string) (string, int64, error) {
-	client := &ytdl.Client{}
+	client := &ytdl.Client{
+		HTTPClient: getHTTPClientWithProxy(),
+	}
 
 	video, err := client.GetVideoContext(ctx, ytURL)
 	if err != nil {
