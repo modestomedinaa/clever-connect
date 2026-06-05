@@ -3,7 +3,7 @@ import { FiPlay, FiSquare, FiSave, FiRefreshCw, FiPlus, FiTrash2, FiCpu, FiShiel
 import { showGlobalConfirm } from '../store/dialogStore';
 
 interface SoroushAccount {
-  ID: number;
+  id: number;
   phone_number: string;
   name: string;
   display_name: string;
@@ -309,7 +309,7 @@ export const SoroushPage: React.FC = () => {
             {accounts.length > 0 && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}>
                 {accounts.map(a => (
-                  <div key={a.ID} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', borderRadius: 8, border: '1px solid var(--color-brand-border)', background: 'var(--color-brand-bg)' }}>
+                  <div key={a.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', borderRadius: 8, border: '1px solid var(--color-brand-border)', background: 'var(--color-brand-bg)' }}>
                     <div style={{ flex: 1 }}>
                       <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-brand-heading)' }}>{a.display_name || a.name || a.phone_number}</div>
                       <div style={{ fontSize: 11, color: 'var(--color-brand-text)', marginTop: 2 }}>{a.phone_number} · {a.role}</div>
@@ -317,11 +317,11 @@ export const SoroushPage: React.FC = () => {
                     <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                       <span style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', color: statusColor(a.status), letterSpacing: 0.5 }}>● {a.status}</span>
                       {a.status !== 'verified' && (
-                        <button className="btn btn--sm" onClick={() => sendCode(a.ID)} disabled={isLoading} title="Send OTP">
+                        <button className="btn btn--sm" onClick={() => sendCode(a.id)} disabled={isLoading} title="Send OTP">
                           <FiSend size={12} />
                         </button>
                       )}
-                      <button className="btn btn--sm" onClick={() => deleteAccount(a.ID)} style={{ color: '#ef4444' }} title="Delete"><FiTrash2 size={12} /></button>
+                      <button className="btn btn--sm" onClick={() => deleteAccount(a.id)} style={{ color: '#ef4444' }} title="Delete"><FiTrash2 size={12} /></button>
                     </div>
                   </div>
                 ))}
