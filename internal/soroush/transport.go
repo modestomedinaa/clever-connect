@@ -1,19 +1,16 @@
 package soroush
 
 import (
-	"io"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/hashicorp/yamux"
-	"github.com/pion/webrtc/v4"
 )
 
-// WebRTCTransport manages the WebRTC P2P DataChannel connection.
+// WebRTCTransport manages the LiveKit SFU DataChannel connection.
+// Retained as a thin wrapper for backwards compatibility with the
+// pool and worker injection interface.
 type WebRTCTransport struct {
-	pc       *webrtc.PeerConnection
-	dc       *webrtc.DataChannel
 	rawConn  net.Conn
 	yamuxSes *yamux.Session
 	mu       sync.Mutex
@@ -48,43 +45,4 @@ func (t *WebRTCTransport) Close() {
 	if t.rawConn != nil {
 		t.rawConn.Close()
 	}
-	if t.pc != nil {
-		t.pc.Close()
-	}
-}
-
-// WebRTCAddr implements net.Addr for WebRTC connections.
-type WebRTCAddr struct {
-	network string
-	address string
-}
-
-func (a *WebRTCAddr) Network() string { return a.network }
-func (a *WebRTCAddr) String() string  { return a.address }
-
-// DataChannelConn wraps a detached WebRTC DataChannel to satisfy net.Conn.
-type DataChannelConn struct {
-	io.ReadWriteCloser
-	localAddr  net.Addr
-	remoteAddr net.Addr
-}
-
-func (c *DataChannelConn) LocalAddr() net.Addr {
-	return c.localAddr
-}
-
-func (c *DataChannelConn) RemoteAddr() net.Addr {
-	return c.remoteAddr
-}
-
-func (c *DataChannelConn) SetDeadline(t time.Time) error {
-	return nil
-}
-
-func (c *DataChannelConn) SetReadDeadline(t time.Time) error {
-	return nil
-}
-
-func (c *DataChannelConn) SetWriteDeadline(t time.Time) error {
-	return nil
 }

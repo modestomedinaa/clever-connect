@@ -95,9 +95,11 @@ type SoroushTunnelConfig struct {
 	ServerPhoneNumber string `json:"server_phone_number"` // Soroush phone number of the server
 	PairingPIN        string `json:"pairing_pin"`         // Symmetric AES key to encrypt SDP messages
 	PSK               string `json:"psk"`                 // Pre-Shared Key for worker auth
+	LiveKitURL        string `json:"livekit_url"`         // LiveKit SFU WebSocket endpoint (e.g., wss://im-server.splus.ir)
+	LiveKitToken      string `json:"livekit_token"`       // LiveKit JWT token for SFU room access
 	SocksPort         int    `json:"socks_port" gorm:"default:4046"`
 	IsActive          bool   `json:"is_active" gorm:"default:false"`
-	EngineMode        string `json:"engine_mode" gorm:"size:30;default:'swarm'"` // 'swarm' (Message-Signaled P2P Swarm)
+	EngineMode        string `json:"engine_mode" gorm:"size:30;default:'swarm'"` // 'swarm' (LiveKit SFU Swarm)
 	MaxWorkers        int    `json:"max_workers" gorm:"default:5"`
 	LoadBalanceAlgo   string `json:"load_balance_algo" gorm:"size:30;default:'least-latency'"` // 'round-robin', 'least-latency'
 }

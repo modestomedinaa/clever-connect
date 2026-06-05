@@ -282,6 +282,8 @@ func (h *SoroushHandler) UpdateSoroushConfig(c *gin.Context) {
 		ServerPhoneNumber string `json:"server_phone_number"`
 		PairingPIN        string `json:"pairing_pin"`
 		PSK               string `json:"psk"`
+		LiveKitURL        string `json:"livekit_url"`
+		LiveKitToken      string `json:"livekit_token"`
 		SocksPort         int    `json:"socks_port"`
 		MaxWorkers         int    `json:"max_workers"`
 		LoadBalanceAlgo    string `json:"load_balance_algo"`
@@ -307,6 +309,12 @@ func (h *SoroushHandler) UpdateSoroushConfig(c *gin.Context) {
 	}
 	if req.PSK != "" {
 		cfg.PSK = req.PSK
+	}
+	if req.LiveKitURL != "" {
+		cfg.LiveKitURL = req.LiveKitURL
+	}
+	if req.LiveKitToken != "" {
+		cfg.LiveKitToken = req.LiveKitToken
 	}
 	if req.SocksPort != 0 {
 		cfg.SocksPort = req.SocksPort
@@ -463,6 +471,8 @@ func (h *SoroushHandler) SyncConfig(c *gin.Context) {
 			"server_phone_number": cfg.ServerPhoneNumber,
 			"pairing_pin":        cfg.PairingPIN,
 			"psk":                cfg.PSK,
+			"livekit_url":        cfg.LiveKitURL,
+			"livekit_token":      cfg.LiveKitToken,
 			"socks_port":         cfg.SocksPort,
 			"max_workers":        cfg.MaxWorkers,
 			"load_balance_algo":  cfg.LoadBalanceAlgo,
@@ -512,6 +522,8 @@ func (h *SoroushHandler) IngestSync(c *gin.Context) {
 			ServerPhoneNumber string `json:"server_phone_number"`
 			PairingPIN        string `json:"pairing_pin"`
 			PSK               string `json:"psk"`
+			LiveKitURL        string `json:"livekit_url"`
+			LiveKitToken      string `json:"livekit_token"`
 			SocksPort         int    `json:"socks_port"`
 			MaxWorkers         int    `json:"max_workers"`
 			LoadBalanceAlgo    string `json:"load_balance_algo"`
@@ -541,6 +553,12 @@ func (h *SoroushHandler) IngestSync(c *gin.Context) {
 	cfg.ServerPhoneNumber = p.ServerPhoneNumber
 	cfg.PairingPIN = p.PairingPIN
 	cfg.PSK = p.PSK
+	if p.LiveKitURL != "" {
+		cfg.LiveKitURL = p.LiveKitURL
+	}
+	if p.LiveKitToken != "" {
+		cfg.LiveKitToken = p.LiveKitToken
+	}
 	if p.SocksPort > 0 {
 		cfg.SocksPort = p.SocksPort
 	}
