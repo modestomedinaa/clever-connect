@@ -105,6 +105,37 @@ func (h *SoroushHandler) DeleteSoroushAccount(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "deleted", "id": id})
 }
 
+// UpdateSoroushAccountToken handles PUT /api/soroush/accounts/:id/token
+// Sets the per-account LiveKit JWT token for a specific worker account.
+func (h *SoroushHandler) UpdateSoroushAccountToken(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid account ID"})
+		return
+	}
+
+	var req struct {
+		LiveKitToken string `json:"livekit_token" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request: " + err.Error()})
+		return
+	}
+
+	var account models.SoroushAccount
+	if err := db.DB.First(&account, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Account not found"})
+		return
+	}
+
+	account.LiveKitToken = req.LiveKitToken
+	db.DB.Save(&account)
+
+	logger.Info("Soroush", "Account LiveKit token updated", "phone", maskPhoneForLog(account.PhoneNumber))
+	c.JSON(http.StatusOK, gin.H{"status": "updated", "account": account})
+}
+
 // SendVerificationCode handles POST /api/soroush/accounts/:id/send-code
 // Triggers MTProto auth.sendCode() for the account.
 func (h *SoroushHandler) SendVerificationCode(c *gin.Context) {
@@ -279,14 +310,12 @@ func (h *SoroushHandler) GetSoroushConfig(c *gin.Context) {
 // UpdateSoroushConfig handles PUT /api/soroush/config
 func (h *SoroushHandler) UpdateSoroushConfig(c *gin.Context) {
 	var req struct {
-		ServerPhoneNumber string `json:"server_phone_number"`
-		PairingPIN        string `json:"pairing_pin"`
-		PSK               string `json:"psk"`
-		LiveKitURL        string `json:"livekit_url"`
-		LiveKitToken      string `json:"livekit_token"`
-		SocksPort         int    `json:"socks_port"`
-		MaxWorkers         int    `json:"max_workers"`
-		LoadBalanceAlgo    string `json:"load_balance_algo"`
+		ServerIdentity  string `json:"server_identity"`
+		PSK             string `json:"psk"`
+		LiveKitURL      string `json:"livekit_url"`
+		SocksPort       int    `json:"socks_port"`
+		MaxWorkers      int    `json:"max_workers"`
+		LoadBalanceAlgo string `json:"load_balance_algo"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -301,20 +330,14 @@ func (h *SoroushHandler) UpdateSoroushConfig(c *gin.Context) {
 	}
 
 	// Update only non-zero fields
-	if req.ServerPhoneNumber != "" {
-		cfg.ServerPhoneNumber = req.ServerPhoneNumber
-	}
-	if req.PairingPIN != "" {
-		cfg.PairingPIN = req.PairingPIN
+	if req.ServerIdentity != "" {
+		cfg.ServerIdentity = req.ServerIdentity
 	}
 	if req.PSK != "" {
 		cfg.PSK = req.PSK
 	}
 	if req.LiveKitURL != "" {
 		cfg.LiveKitURL = req.LiveKitURL
-	}
-	if req.LiveKitToken != "" {
-		cfg.LiveKitToken = req.LiveKitToken
 	}
 	if req.SocksPort != 0 {
 		cfg.SocksPort = req.SocksPort
@@ -444,7 +467,7 @@ func (h *SoroushHandler) GetSoroushEngineStatus(c *gin.Context) {
 func (h *SoroushHandler) TestTokenFetch(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status":  "not_needed",
-		"message": "Direct P2P WebRTC DataChannel swarm does not require group call room tokens.",
+		"message": "LiveKit SFU tokens are now set per-account via PUT /api/soroush/accounts/:id/token.",
 	})
 }
 
@@ -468,11 +491,9 @@ func (h *SoroushHandler) SyncConfig(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"sync_payload": gin.H{
-			"server_phone_number": cfg.ServerPhoneNumber,
-			"pairing_pin":        cfg.PairingPIN,
+			"server_identity":    cfg.ServerIdentity,
 			"psk":                cfg.PSK,
 			"livekit_url":        cfg.LiveKitURL,
-			"livekit_token":      cfg.LiveKitToken,
 			"socks_port":         cfg.SocksPort,
 			"max_workers":        cfg.MaxWorkers,
 			"load_balance_algo":  cfg.LoadBalanceAlgo,
@@ -519,15 +540,13 @@ func (h *SoroushHandler) IngestSync(c *gin.Context) {
 
 	var syncResp struct {
 		SyncPayload struct {
-			ServerPhoneNumber string `json:"server_phone_number"`
-			PairingPIN        string `json:"pairing_pin"`
-			PSK               string `json:"psk"`
-			LiveKitURL        string `json:"livekit_url"`
-			LiveKitToken      string `json:"livekit_token"`
-			SocksPort         int    `json:"socks_port"`
-			MaxWorkers         int    `json:"max_workers"`
-			LoadBalanceAlgo    string `json:"load_balance_algo"`
-			VerifyToken       string `json:"verification_token"`
+			ServerIdentity  string `json:"server_identity"`
+			PSK             string `json:"psk"`
+			LiveKitURL      string `json:"livekit_url"`
+			SocksPort       int    `json:"socks_port"`
+			MaxWorkers      int    `json:"max_workers"`
+			LoadBalanceAlgo string `json:"load_balance_algo"`
+			VerifyToken     string `json:"verification_token"`
 		} `json:"sync_payload"`
 	}
 
@@ -550,14 +569,12 @@ func (h *SoroushHandler) IngestSync(c *gin.Context) {
 		return
 	}
 
-	cfg.ServerPhoneNumber = p.ServerPhoneNumber
-	cfg.PairingPIN = p.PairingPIN
+	if p.ServerIdentity != "" {
+		cfg.ServerIdentity = p.ServerIdentity
+	}
 	cfg.PSK = p.PSK
 	if p.LiveKitURL != "" {
 		cfg.LiveKitURL = p.LiveKitURL
-	}
-	if p.LiveKitToken != "" {
-		cfg.LiveKitToken = p.LiveKitToken
 	}
 	if p.SocksPort > 0 {
 		cfg.SocksPort = p.SocksPort
@@ -572,7 +589,7 @@ func (h *SoroushHandler) IngestSync(c *gin.Context) {
 	db.DB.Save(&cfg)
 
 	logger.Info("Soroush", "Client synced with server",
-		"server_phone", cfg.ServerPhoneNumber,
+		"server_identity", cfg.ServerIdentity,
 	)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -589,4 +606,3 @@ func maskPhoneForLog(phone string) string {
 	}
 	return phone[:3] + "****" + phone[len(phone)-2:]
 }
-
