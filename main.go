@@ -251,6 +251,7 @@ func main() {
 			protected.GET("/soroush/accounts", soroushHandler.GetSoroushAccounts)
 			protected.POST("/soroush/accounts", soroushHandler.AddSoroushAccount)
 			protected.DELETE("/soroush/accounts/:id", soroushHandler.DeleteSoroushAccount)
+			protected.PUT("/soroush/accounts/:id/token", soroushHandler.UpdateSoroushAccountToken)
 			protected.POST("/soroush/accounts/:id/send-code", soroushHandler.SendVerificationCode)
 			protected.POST("/soroush/accounts/:id/verify", soroushHandler.VerifyAccount)
 			protected.GET("/soroush/config", soroushHandler.GetSoroushConfig)

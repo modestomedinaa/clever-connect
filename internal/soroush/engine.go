@@ -47,9 +47,8 @@ func StartEngine(cfg *models.SoroushTunnelConfig, accounts []models.SoroushAccou
 		return fmt.Errorf("PSK is required for in-band DataChannel authentication")
 	}
 
-	// Make sure the frontend/database provides the extracted LiveKit tokens
-	if cfg.LiveKitToken == "" {
-		return fmt.Errorf("LiveKitToken is required for SFU WebRTC connection")
+	if len(accounts) == 0 {
+		return fmt.Errorf("no soroush accounts configured")
 	}
 
 	engineCtx, engineCancel = context.WithCancel(context.Background())
@@ -61,6 +60,13 @@ func StartEngine(cfg *models.SoroushTunnelConfig, accounts []models.SoroushAccou
 	mode := "client"
 	if isServer {
 		mode = "server"
+		if cfg.ServerIdentity == "" {
+			logger.Warn(component, "ServerIdentity is empty; clients will not know who to route to")
+		}
+	} else {
+		if cfg.ServerIdentity == "" {
+			return fmt.Errorf("ServerIdentity is required for clients to locate the server in the SFU room")
+		}
 	}
 
 	logger.Info(component, "Starting Soroush LiveKit engine",
@@ -71,7 +77,8 @@ func StartEngine(cfg *models.SoroushTunnelConfig, accounts []models.SoroushAccou
 	)
 
 	if isServer {
-		go runServer(engineCtx, cfg)
+		// Server uses the first account as the host
+		go runServer(engineCtx, cfg, &accounts[0])
 	} else {
 		go runClient(engineCtx, cfg, accounts)
 	}
@@ -80,18 +87,24 @@ func StartEngine(cfg *models.SoroushTunnelConfig, accounts []models.SoroushAccou
 }
 
 // runServer starts the server-side (Queen) engine bound to the LiveKit Room.
-func runServer(ctx context.Context, cfg *models.SoroushTunnelConfig) {
+// Uses the host account's per-account LiveKitToken for connection.
+func runServer(ctx context.Context, cfg *models.SoroushTunnelConfig, hostAccount *models.SoroushAccount) {
 	logger.Info(component, "Server engine goroutine started, initializing SFU Listener")
+
+	if hostAccount.LiveKitToken == "" {
+		logger.Error(component, "Server: Host account is missing LiveKitToken")
+		return
+	}
 
 	url := cfg.LiveKitURL
 	if url == "" {
-		url = "wss://im-server.splus.ir" // Standard endpoint
+		url = "wss://k.splus.ir" // Default Soroush LiveKit endpoint
 	}
 
 	// Create listener + callback BEFORE connecting (room.callback is unexported in v2 SDK)
 	listener, listenerCb := NewLiveKitListener()
 
-	room, err := lksdk.ConnectToRoomWithToken(url, cfg.LiveKitToken, listenerCb)
+	room, err := lksdk.ConnectToRoomWithToken(url, hostAccount.LiveKitToken, listenerCb)
 	if err != nil {
 		logger.Error(component, "Server: Failed to connect to LiveKit Room", "error", err)
 		return
@@ -101,7 +114,9 @@ func runServer(ctx context.Context, cfg *models.SoroushTunnelConfig) {
 	// Bind the room reference so LiveKitConn.Write() can publish data
 	listener.BindRoom(room)
 
-	logger.Info(component, "Server: Connected to SFU. Virtual Listener active, awaiting worker traffic...")
+	logger.Info(component, "Server: Connected to SFU. Virtual Listener active, awaiting worker traffic...",
+		"local_identity", room.LocalParticipant.Identity(),
+	)
 	defer listener.Close()
 
 	// Spin off context cancellation watcher
@@ -202,7 +217,8 @@ func runClient(ctx context.Context, cfg *models.SoroushTunnelConfig, accounts []
 	logger.Info(component, "Client engine shutting down — all workers exited")
 }
 
-// runWorker manages a single worker connection to the SFU Room
+// runWorker manages a single worker connection to the SFU Room.
+// Each worker uses its own per-account LiveKitToken to avoid identity collisions.
 func runWorker(ctx context.Context, cfg *models.SoroushTunnelConfig, acct *models.SoroushAccount, pool *MultiplexerPool) {
 	defer func() {
 		db.DB.Model(acct).Update("status", "idle")
@@ -227,35 +243,56 @@ func runWorker(ctx context.Context, cfg *models.SoroushTunnelConfig, acct *model
 			cfg = &latestCfg
 		}
 
-		url := cfg.LiveKitURL
-		if url == "" {
-			url = "wss://im-server.splus.ir"
+		// Reload account to pick up refreshed LiveKitToken
+		var latestAcct models.SoroushAccount
+		if err := db.DB.First(&latestAcct, acct.ID).Error; err == nil {
+			acct = &latestAcct
 		}
 
-		// Because it's an SFU room, we must manually construct a virtual connection targeting the Queen's ID.
-		// Soroush's token dictates identity, so the server target identity may need configuration.
-		serverTargetIdentity := "server"
-
-		// Pre-wire the data callback BEFORE connecting (room.callback is unexported in v2 SDK).
-		// We'll set the room reference on conn after connection succeeds.
-		var conn *LiveKitConn
-		roomCb := lksdk.NewRoomCallback()
-		roomCb.OnDataReceived = func(data []byte, params lksdk.DataReceiveParams) {
-			if conn != nil && params.SenderIdentity == serverTargetIdentity {
-				_ = conn.WriteIncoming(data)
-			}
-		}
-
-		// Connect as an active participant to the SFU.
-		room, err := lksdk.ConnectToRoomWithToken(url, cfg.LiveKitToken, roomCb)
-		if err != nil {
-			logger.Error(component, "Worker: Failed to connect to SFU Room", "error", err)
+		if acct.LiveKitToken == "" {
+			logger.Error(component, "Worker: LiveKitToken is empty for this account. Skipping.", "phone", maskPhone(acct.PhoneNumber))
 			db.DB.Model(acct).Update("status", "error")
 			sleepWithContext(ctx, 10*time.Second)
 			continue
 		}
 
-		conn = NewLiveKitConn(room, serverTargetIdentity)
+		url := cfg.LiveKitURL
+		if url == "" {
+			url = "wss://k.splus.ir" // Default Soroush LiveKit endpoint
+		}
+
+		serverTargetIdentity := cfg.ServerIdentity
+
+		// [FIX #3] Initialize the io.Pipe and LiveKitConn BEFORE connecting to
+		// prevent nil-pointer race: if the server sends data the microsecond we
+		// connect, the callback must already have a live pipe to write into.
+		pr, pw := io.Pipe()
+		conn := &LiveKitConn{
+			targetIdentity: serverTargetIdentity,
+			pr:             pr,
+			pw:             pw,
+		}
+
+		roomCb := lksdk.NewRoomCallback()
+		roomCb.OnDataReceived = func(data []byte, params lksdk.DataReceiveParams) {
+			// Only accept data originating from the Queen Server identity
+			if params.SenderIdentity == serverTargetIdentity {
+				_ = conn.WriteIncoming(data)
+			}
+		}
+
+		// Each worker connects with its OWN per-account token (unique identity)
+		room, err := lksdk.ConnectToRoomWithToken(url, acct.LiveKitToken, roomCb)
+		if err != nil {
+			logger.Error(component, "Worker: Failed to connect to SFU Room", "error", err)
+			db.DB.Model(acct).Update("status", "error")
+			conn.Close() // cleanup pipe
+			sleepWithContext(ctx, 10*time.Second)
+			continue
+		}
+
+		// Attach room reference after successful connection so Write() can publish
+		conn.room = room
 
 		// Send 64-byte HKDF challenge
 		challenge, err := BuildHandshakeChallenge(cfg.PSK)
@@ -292,7 +329,7 @@ func runWorker(ctx context.Context, cfg *models.SoroushTunnelConfig, acct *model
 		// Inject into load balancer pool
 		wc := &WorkerChannel{
 			AccountID:    fmt.Sprintf("%d", acct.ID),
-			Transport:    &WebRTCTransport{}, // Stub for backwards compatibility with pool
+			Transport:    &WebRTCTransport{}, // Stub for pool logic
 			YamuxSession: yamuxSess,
 			Healthy:      true,
 		}
