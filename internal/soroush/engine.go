@@ -138,6 +138,54 @@ func runClient(ctx context.Context, cfg *models.SoroushTunnelConfig, accounts []
 	// Start health checker
 	go pool.HealthCheck(ctx)
 
+	// Start pool health monitor to trigger fallback sync if we lose all healthy connections (e.g. room replaced)
+	if cfg.ServerHostPhone != "" && cfg.PairingPIN != "" {
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+
+			var lastHealthy time.Time = time.Now()
+			var fallbackActive atomic.Bool
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					stats := pool.Stats()
+					if stats.HealthyWorkers > 0 {
+						lastHealthy = time.Now()
+						continue
+					}
+
+					// If we've had 0 healthy workers for more than 45 seconds, trigger fallback sync
+					if time.Since(lastHealthy) > 45*time.Second {
+						if fallbackActive.CompareAndSwap(false, true) {
+							logger.Warn(component, "Pool Health Monitor: All workers unhealthy for >45s. Triggering fallback config sync...")
+							
+							go func() {
+								defer fallbackActive.Store(false)
+								
+								// Fetch current config from DB to get the latest settings
+								var latestCfg models.SoroushTunnelConfig
+								if err := db.DB.First(&latestCfg).Error; err != nil {
+									logger.Error(component, "Pool Health Monitor: Failed to load config from database", "error", err)
+									return
+								}
+
+								// Execute in-band fallback sync to retrieve the new group call room details
+								RunFallbackSync(ctx, &latestCfg, accounts)
+							}()
+							
+							// Reset timer to avoid spamming fallback sync triggers
+							lastHealthy = time.Now()
+						}
+					}
+				}
+			}
+		}()
+	}
+
 	// Launch worker goroutines (up to MaxWorkers or len(accounts))
 	maxWorkers := cfg.MaxWorkers
 	if maxWorkers > len(accounts) {
@@ -176,6 +224,12 @@ func runWorker(ctx context.Context, cfg *models.SoroushTunnelConfig, acct *model
 		// Pool Re-balancing Jitter: sleep 2-4 seconds (3s +/- 1s) to avoid bombarding Soroush login gateways simultaneously
 		jitter := time.Duration(2000+rand.Intn(2000)) * time.Millisecond
 		sleepWithContext(ctx, jitter)
+
+		// Load the latest config from database on every connect/reconnect loop iteration
+		var latestCfg models.SoroushTunnelConfig
+		if err := db.DB.First(&latestCfg).Error; err == nil {
+			cfg = &latestCfg
+		}
 
 		tm := NewTokenManager(acct, cfg)
 		if err := tm.Start(ctx); err != nil {
@@ -312,10 +366,25 @@ func maskPhone(phone string) string {
 
 // RunFallbackMode connects to MTProto, imports and resolves the Server's phone number,
 // sends an encrypted WAKEUP message, and waits for the encrypted configuration payload.
+// It automatically boots the client engine once the sync is completed.
 func RunFallbackMode(ctx context.Context, cfg *models.SoroushTunnelConfig, accounts []models.SoroushAccount) {
+	if success := runFallbackSyncInternal(ctx, cfg, accounts); success {
+		// Launch the regular Client engine
+		go runClient(ctx, cfg, accounts)
+	}
+}
+
+// RunFallbackSync connects to Soroush MTProto, fetches the updated configuration,
+// and persists it to the database so that existing client workers can automatically reconnect.
+func RunFallbackSync(ctx context.Context, cfg *models.SoroushTunnelConfig, accounts []models.SoroushAccount) {
+	runFallbackSyncInternal(ctx, cfg, accounts)
+}
+
+// runFallbackSyncInternal is the core helper implementing the Encrypted Ping-Pong fallback exchange.
+func runFallbackSyncInternal(ctx context.Context, cfg *models.SoroushTunnelConfig, accounts []models.SoroushAccount) bool {
 	if cfg.ServerHostPhone == "" || cfg.PairingPIN == "" {
 		logger.Error(component, "Fallback Client: Aborting, server_host_phone or pairing_pin not configured")
-		return
+		return false
 	}
 
 	acct := accounts[0]
@@ -324,20 +393,20 @@ func RunFallbackMode(ctx context.Context, cfg *models.SoroushTunnelConfig, accou
 	session, transport := soroushlib.RestoreSession(acct.AuthKey, acct.AuthKeyID, acct.ServerSalt)
 	if err := transport.Connect(ctx); err != nil {
 		logger.Error(component, "Fallback Client: Failed to connect to Soroush", "error", err)
-		return
+		return false
 	}
 	defer transport.Disconnect()
 
 	if err := session.WarmUpSession(ctx); err != nil {
 		logger.Error(component, "Fallback Client: Failed to warm up Soroush session", "error", err)
-		return
+		return false
 	}
 
 	logger.Info(component, "Fallback Client: Resolving server phone number...", "phone", cfg.ServerHostPhone)
 	serverUserID, serverAccessHash, err := session.ResolvePhone(ctx, cfg.ServerHostPhone)
 	if err != nil {
 		logger.Error(component, "Fallback Client: Failed to resolve server phone", "error", err)
-		return
+		return false
 	}
 
 	logger.Info(component, "Fallback Client: Server resolved successfully", "user_id", serverUserID, "access_hash", serverAccessHash)
@@ -346,7 +415,7 @@ func RunFallbackMode(ctx context.Context, cfg *models.SoroushTunnelConfig, accou
 	ciphertext, err := EncryptPayload("WAKEUP", cfg.PairingPIN)
 	if err != nil {
 		logger.Error(component, "Fallback Client: Encryption failed", "error", err)
-		return
+		return false
 	}
 
 	// Start update router
@@ -363,7 +432,7 @@ func RunFallbackMode(ctx context.Context, cfg *models.SoroushTunnelConfig, accou
 	// Send trigger ping
 	if err := soroushlib.SendTextMessage(ctx, session, serverUserID, serverAccessHash, ciphertext); err != nil {
 		logger.Error(component, "Fallback Client: Failed to send wakeup trigger", "error", err)
-		return
+		return false
 	}
 
 	logger.Info(component, "Fallback Client: Wakeup trigger sent. Awaiting configuration payload...")
@@ -373,7 +442,7 @@ func RunFallbackMode(ctx context.Context, cfg *models.SoroushTunnelConfig, accou
 		case msg, ok := <-msgCh:
 			if !ok {
 				logger.Error(component, "Fallback Client: Message channel closed")
-				return
+				return false
 			}
 			if msg.FromUserID != serverUserID {
 				continue
@@ -408,17 +477,11 @@ func RunFallbackMode(ctx context.Context, cfg *models.SoroushTunnelConfig, accou
 			cfg.GroupAccessHash = payload.GroupAccessHash
 			cfg.PSK = payload.PSK
 			db.DB.Save(cfg)
-
-			// Clean up fallback session
-			transport.Disconnect()
-
-			// Launch the regular Client engine
-			go runClient(ctx, cfg, accounts)
-			return
+			return true
 
 		case <-ctx.Done():
 			logger.Info(component, "Fallback Client: Context cancelled, aborting")
-			return
+			return false
 		}
 	}
 }
