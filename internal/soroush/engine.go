@@ -5,7 +5,9 @@ package soroush
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"clever-connect/internal/db"
 	"clever-connect/internal/logger"
 	"clever-connect/internal/models"
+	"clever-connect/internal/soroushlib"
 )
 
 const component = "Soroush"
@@ -117,6 +120,12 @@ func runServer(ctx context.Context, cfg *models.SoroushTunnelConfig, accounts []
 func runClient(ctx context.Context, cfg *models.SoroushTunnelConfig, accounts []models.SoroushAccount) {
 	logger.Info(component, "Client engine goroutine started")
 
+	if cfg.GroupChatID == 0 {
+		logger.Warn(component, "Client: Target Group Chat ID is missing. Bypassing SwarmPool and entering Fallback Mode...")
+		go RunFallbackMode(ctx, cfg, accounts)
+		return
+	}
+
 	pool := NewMultiplexerPool(cfg.LoadBalanceAlgo)
 
 	// Start SOCKS5 listener
@@ -128,6 +137,54 @@ func runClient(ctx context.Context, cfg *models.SoroushTunnelConfig, accounts []
 
 	// Start health checker
 	go pool.HealthCheck(ctx)
+
+	// Start pool health monitor to trigger fallback sync if we lose all healthy connections (e.g. room replaced)
+	if cfg.ServerHostPhone != "" && cfg.PairingPIN != "" {
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+
+			var lastHealthy time.Time = time.Now()
+			var fallbackActive atomic.Bool
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					stats := pool.Stats()
+					if stats.HealthyWorkers > 0 {
+						lastHealthy = time.Now()
+						continue
+					}
+
+					// If we've had 0 healthy workers for more than 45 seconds, trigger fallback sync
+					if time.Since(lastHealthy) > 45*time.Second {
+						if fallbackActive.CompareAndSwap(false, true) {
+							logger.Warn(component, "Pool Health Monitor: All workers unhealthy for >45s. Triggering fallback config sync...")
+							
+							go func() {
+								defer fallbackActive.Store(false)
+								
+								// Fetch current config from DB to get the latest settings
+								var latestCfg models.SoroushTunnelConfig
+								if err := db.DB.First(&latestCfg).Error; err != nil {
+									logger.Error(component, "Pool Health Monitor: Failed to load config from database", "error", err)
+									return
+								}
+
+								// Execute in-band fallback sync to retrieve the new group call room details
+								RunFallbackSync(ctx, &latestCfg, accounts)
+							}()
+							
+							// Reset timer to avoid spamming fallback sync triggers
+							lastHealthy = time.Now()
+						}
+					}
+				}
+			}
+		}()
+	}
 
 	// Launch worker goroutines (up to MaxWorkers or len(accounts))
 	maxWorkers := cfg.MaxWorkers
@@ -163,6 +220,16 @@ func runWorker(ctx context.Context, cfg *models.SoroushTunnelConfig, acct *model
 
 		logger.Info(component, "Worker starting", "phone", maskPhone(acct.PhoneNumber))
 		db.DB.Model(acct).Update("status", "connecting")
+
+		// Pool Re-balancing Jitter: sleep 2-4 seconds (3s +/- 1s) to avoid bombarding Soroush login gateways simultaneously
+		jitter := time.Duration(2000+rand.Intn(2000)) * time.Millisecond
+		sleepWithContext(ctx, jitter)
+
+		// Load the latest config from database on every connect/reconnect loop iteration
+		var latestCfg models.SoroushTunnelConfig
+		if err := db.DB.First(&latestCfg).Error; err == nil {
+			cfg = &latestCfg
+		}
 
 		tm := NewTokenManager(acct, cfg)
 		if err := tm.Start(ctx); err != nil {
@@ -295,4 +362,126 @@ func maskPhone(phone string) string {
 		return "****"
 	}
 	return phone[:3] + "****" + phone[len(phone)-2:]
+}
+
+// RunFallbackMode connects to MTProto, imports and resolves the Server's phone number,
+// sends an encrypted WAKEUP message, and waits for the encrypted configuration payload.
+// It automatically boots the client engine once the sync is completed.
+func RunFallbackMode(ctx context.Context, cfg *models.SoroushTunnelConfig, accounts []models.SoroushAccount) {
+	if success := runFallbackSyncInternal(ctx, cfg, accounts); success {
+		// Launch the regular Client engine
+		go runClient(ctx, cfg, accounts)
+	}
+}
+
+// RunFallbackSync connects to Soroush MTProto, fetches the updated configuration,
+// and persists it to the database so that existing client workers can automatically reconnect.
+func RunFallbackSync(ctx context.Context, cfg *models.SoroushTunnelConfig, accounts []models.SoroushAccount) {
+	runFallbackSyncInternal(ctx, cfg, accounts)
+}
+
+// runFallbackSyncInternal is the core helper implementing the Encrypted Ping-Pong fallback exchange.
+func runFallbackSyncInternal(ctx context.Context, cfg *models.SoroushTunnelConfig, accounts []models.SoroushAccount) bool {
+	if cfg.ServerHostPhone == "" || cfg.PairingPIN == "" {
+		logger.Error(component, "Fallback Client: Aborting, server_host_phone or pairing_pin not configured")
+		return false
+	}
+
+	acct := accounts[0]
+	logger.Info(component, "Fallback Client: Starting fallback loop using worker", "phone", maskPhone(acct.PhoneNumber))
+
+	session, transport := soroushlib.RestoreSession(acct.AuthKey, acct.AuthKeyID, acct.ServerSalt)
+	if err := transport.Connect(ctx); err != nil {
+		logger.Error(component, "Fallback Client: Failed to connect to Soroush", "error", err)
+		return false
+	}
+	defer transport.Disconnect()
+
+	if err := session.WarmUpSession(ctx); err != nil {
+		logger.Error(component, "Fallback Client: Failed to warm up Soroush session", "error", err)
+		return false
+	}
+
+	logger.Info(component, "Fallback Client: Resolving server phone number...", "phone", cfg.ServerHostPhone)
+	serverUserID, serverAccessHash, err := session.ResolvePhone(ctx, cfg.ServerHostPhone)
+	if err != nil {
+		logger.Error(component, "Fallback Client: Failed to resolve server phone", "error", err)
+		return false
+	}
+
+	logger.Info(component, "Fallback Client: Server resolved successfully", "user_id", serverUserID, "access_hash", serverAccessHash)
+
+	// Prepare encrypted trigger message
+	ciphertext, err := EncryptPayload("WAKEUP", cfg.PairingPIN)
+	if err != nil {
+		logger.Error(component, "Fallback Client: Encryption failed", "error", err)
+		return false
+	}
+
+	// Start update router
+	router := soroushlib.NewMessageRouter(session)
+	go func() {
+		if err := router.Run(ctx); err != nil && ctx.Err() == nil {
+			logger.Error(component, "Fallback Client MessageRouter error", "error", err)
+		}
+	}()
+
+	msgCh := router.SubscribeText()
+	defer router.UnsubscribeText(msgCh)
+
+	// Send trigger ping
+	if err := soroushlib.SendTextMessage(ctx, session, serverUserID, serverAccessHash, ciphertext); err != nil {
+		logger.Error(component, "Fallback Client: Failed to send wakeup trigger", "error", err)
+		return false
+	}
+
+	logger.Info(component, "Fallback Client: Wakeup trigger sent. Awaiting configuration payload...")
+
+	for {
+		select {
+		case msg, ok := <-msgCh:
+			if !ok {
+				logger.Error(component, "Fallback Client: Message channel closed")
+				return false
+			}
+			if msg.FromUserID != serverUserID {
+				continue
+			}
+
+			// Decrypt response
+			decrypted, err := DecryptPayload(msg.Text, cfg.PairingPIN)
+			if err != nil {
+				// Not a ciphertext or invalid key, skip
+				continue
+			}
+
+			// Parse JSON
+			var payload FallbackConfigPayload
+			if err := json.Unmarshal([]byte(decrypted), &payload); err != nil {
+				logger.Error(component, "Fallback Client: Failed to unmarshal payload JSON", "error", err)
+				continue
+			}
+
+			if payload.GroupChatID == 0 || payload.PSK == "" {
+				logger.Warn(component, "Fallback Client: Received empty fields in configuration payload")
+				continue
+			}
+
+			logger.Info(component, "Fallback Client: Received and decrypted configuration successfully!",
+				"group_chat_id", payload.GroupChatID,
+				"psk", payload.PSK,
+			)
+
+			// Persist retrieved config
+			cfg.GroupChatID = payload.GroupChatID
+			cfg.GroupAccessHash = payload.GroupAccessHash
+			cfg.PSK = payload.PSK
+			db.DB.Save(cfg)
+			return true
+
+		case <-ctx.Done():
+			logger.Info(component, "Fallback Client: Context cancelled, aborting")
+			return false
+		}
+	}
 }
