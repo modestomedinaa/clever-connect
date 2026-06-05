@@ -309,7 +309,7 @@ func serveEmbeddedSPA(embedFS fs.FS) gin.HandlerFunc {
 		path := c.Request.URL.Path
 
 		// If route matches API endpoints, continue to other middleware/handlers
-		if strings.HasPrefix(path, "/api") || strings.HasPrefix(path, "/ws") || strings.HasPrefix(path, "/swagger") {
+		if strings.HasPrefix(path, "/api") || strings.HasPrefix(path, "/ws") || strings.HasPrefix(path, "/swagger") || path == "/favicon.ico" || path == "/favicon.png" {
 			c.Next()
 			return
 		}
