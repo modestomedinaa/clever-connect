@@ -12,8 +12,8 @@ import (
 	"clever-connect/internal/models"
 
 	"golang.org/x/crypto/bcrypt"
+	sqlite "clever-connect/internal/db/sqlite"
 	"gorm.io/driver/mysql"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 )
@@ -163,13 +163,10 @@ func InitDB(cfg *config.Config) *gorm.DB {
 		}
 		DB.Create(&models.SoroushTunnelConfig{
 			PSK:                hex.EncodeToString(pskBytes),
-			LiveKitURL:          "wss://k.splus.ir:8446",
 			SocksPort:           4046,
-			EngineMode:          "hybrid",
+			EngineMode:          "swarm",
 			MaxWorkers:          5,
 			LoadBalanceAlgo:     "least-latency",
-			TokenRefreshMinSec:  420,
-			TokenRefreshMaxSec:  540,
 		})
 	}
 
