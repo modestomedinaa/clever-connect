@@ -97,6 +97,7 @@ func InitDB(cfg *config.Config) *gorm.DB {
 	// Ensure the table collation is converted to utf8mb4 to support emoji/symbols in welcome messages
 	if DB.Dialector.Name() == "mysql" {
 		DB.Exec("ALTER TABLE `telegram_configs` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+		DB.Exec("ALTER TABLE `soroush_tunnel_configs` MODIFY COLUMN `call_access_hash` VARCHAR(1024) NULL")
 	}
 	logger.Info("DB", "Schema migrations completed successfully")
 
