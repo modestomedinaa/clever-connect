@@ -3,6 +3,7 @@ package soroush
 
 import (
 	"net"
+	"sync"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -17,7 +18,6 @@ type LiveKitAddr struct {
 func (a *LiveKitAddr) Network() string { return "livekit" }
 func (a *LiveKitAddr) String() string  { return a.Identity }
 
-// rxPacket pairs the raw payload with its validated sender address.
 type rxPacket struct {
 	data []byte
 	addr net.Addr
@@ -27,6 +27,7 @@ type rxPacket struct {
 type RtpPacketConn struct {
 	localTrack *webrtc.TrackLocalStaticSample
 	rxQueue    chan rxPacket
+	mu         sync.RWMutex // Protects closed state to prevent runtime channel panics
 	closed     bool
 }
 
@@ -35,19 +36,17 @@ type RtpPacketConn struct {
 func NewRtpPacketConn(track *webrtc.TrackLocalStaticSample) *RtpPacketConn {
 	return &RtpPacketConn{
 		localTrack: track,
-		rxQueue:    make(chan rxPacket, 4096), // Enhanced depth for high-throughput concurrency
+		rxQueue:    make(chan rxPacket, 4096),
 	}
 }
 
-// PushRx captures payloads, validates the 'Q' tag, and preserves sender origin.
+// PushRx captures payloads safely checking closed state to prevent runtime channel panics.
 func (c *RtpPacketConn) PushRx(payload []byte, senderIdentity string) {
 	if len(payload) == 0 {
 		return
 	}
 
-	// Filter for the custom QUIC multiplexer tag ('Q')
 	if payload[0] == 0x51 {
-		// Strip the tag and safely extract the underlying payload
 		cleanData := make([]byte, len(payload)-1)
 		copy(cleanData, payload[1:])
 
@@ -56,10 +55,18 @@ func (c *RtpPacketConn) PushRx(payload []byte, senderIdentity string) {
 			addr: &LiveKitAddr{Identity: senderIdentity},
 		}
 
+		// Read-lock to verify channel safety
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+
+		if c.closed {
+			return
+		}
+
 		select {
 		case c.rxQueue <- packet:
 		default:
-			// Queue full — drop frame safely. QUIC's recovery layer handles it natively.
+			// Queue full — drop frame safely.
 		}
 	}
 }
@@ -76,16 +83,18 @@ func (c *RtpPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 
 // WriteTo transmits outbound frames into the LiveKit audio router track.
 func (c *RtpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	if c.closed {
+	c.mu.RLock()
+	isClosed := c.closed
+	c.mu.RUnlock()
+
+	if isClosed {
 		return 0, net.ErrClosed
 	}
 
-	// 1-byte overhead for the protocol isolation tag
 	payload := make([]byte, 1+len(p))
 	payload[0] = 0x51
 	copy(payload[1:], p)
 
-	// Keep strict 20ms pacing frame windows to prevent SFU anti-flood triggers
 	err = c.localTrack.WriteSample(media.Sample{
 		Data:     payload,
 		Duration: time.Millisecond * 20,
@@ -94,13 +103,19 @@ func (c *RtpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	return len(p), err
 }
 
+// Close explicitly locks and tears down the channel cleanly.
 func (c *RtpPacketConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return nil
+	}
 	c.closed = true
 	close(c.rxQueue)
 	return nil
 }
 
-// Satisfy net.PacketConn boilerplate constraints
 func (c *RtpPacketConn) LocalAddr() net.Addr                { return &LiveKitAddr{Identity: "local"} }
 func (c *RtpPacketConn) SetDeadline(t time.Time) error      { return nil }
 func (c *RtpPacketConn) SetReadDeadline(t time.Time) error  { return nil }
