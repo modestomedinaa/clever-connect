@@ -155,15 +155,17 @@ func runServer(ctx context.Context, cfg *models.SoroushTunnelConfig, hostAccount
 		roomCb := lksdk.NewRoomCallback()
 		roomCb.OnTrackSubscribed = func(track *webrtc.TrackRemote, pub *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
 			if track.Kind() == webrtc.RTPCodecTypeAudio {
-				go func() {
+				logger.Info(component, "Server: Mapping incoming worker track tunnel", "worker_identity", rp.Identity())
+
+				go func(t *webrtc.TrackRemote, identity string) {
 					for {
-						rtpPacket, _, err := track.ReadRTP()
+						rtpPacket, _, err := t.ReadRTP()
 						if err != nil {
 							return
 						}
-						packetConn.PushRx(rtpPacket.Payload)
+						packetConn.PushRx(rtpPacket.Payload, identity)
 					}
-				}()
+				}(track, rp.Identity())
 			}
 		}
 
@@ -350,16 +352,24 @@ func runWorker(ctx context.Context, cfg *models.SoroushTunnelConfig, acct *model
 		// 2. Setup LiveKit Callbacks to intercept incoming audio tracks
 		roomCb := lksdk.NewRoomCallback()
 		roomCb.OnTrackSubscribed = func(track *webrtc.TrackRemote, pub *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
+			// SECURITY FILTER: Enforce isolation by checking the identity against the configured Server Identity
+			if rp.Identity() != cfg.ServerIdentity {
+				logger.Debug(component, "Worker: Skipping unrelated user audio track in room", "identity", rp.Identity())
+				return
+			}
+
 			if track.Kind() == webrtc.RTPCodecTypeAudio {
-				go func() {
+				logger.Info(component, "Worker: Linked downstream tunnel from targeted Queen Server", "server_identity", rp.Identity())
+
+				go func(t *webrtc.TrackRemote, identity string) {
 					for {
-						rtpPacket, _, err := track.ReadRTP()
+						rtpPacket, _, err := t.ReadRTP()
 						if err != nil {
 							return
 						}
-						packetConn.PushRx(rtpPacket.Payload)
+						packetConn.PushRx(rtpPacket.Payload, identity)
 					}
-				}()
+				}(track, rp.Identity())
 			}
 		}
 
@@ -419,7 +429,8 @@ func runQuicClient(ctx context.Context, conn *RtpPacketConn, cfg *models.Soroush
 		KeepAlivePeriod:         time.Second * 15,
 	}
 
-	session, err := quic.Dial(ctx, conn, fakeAddr, tlsConf, quicConf)
+	serverAddr := &LiveKitAddr{Identity: cfg.ServerIdentity}
+	session, err := quic.Dial(ctx, conn, serverAddr, tlsConf, quicConf)
 	if err != nil {
 		return fmt.Errorf("quic dial: %w", err)
 	}
