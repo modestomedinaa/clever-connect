@@ -43,7 +43,7 @@ func GetOrRefreshLiveKitToken(ctx context.Context, cfg *models.SoroushTunnelConf
 	}
 
 	// 2. Attempt dynamic token acquisition
-	token, err := getOrRefreshDynamicToken(ctx, cfg, acct, isServer)
+	token, err := getOrRefreshDynamicToken(ctx, cfg, acct)
 	if err != nil {
 		// Dynamic flow failed. Check if fallback token is available.
 		if cfg.FallbackLiveKitToken != "" {
@@ -63,7 +63,8 @@ func GetOrRefreshLiveKitToken(ctx context.Context, cfg *models.SoroushTunnelConf
 }
 
 // getOrRefreshDynamicToken performs the MTProto handshake to fetch a fresh LiveKit token.
-func getOrRefreshDynamicToken(ctx context.Context, cfg *models.SoroushTunnelConfig, acct *models.SoroushAccount, isServer bool) (string, error) {
+// The group call must already be active — this function resolves and joins it, never creates it.
+func getOrRefreshDynamicToken(ctx context.Context, cfg *models.SoroushTunnelConfig, acct *models.SoroushAccount) (string, error) {
 	logger.Info(componentJit, "JIT: Synchronizing signaling session with wss://im-server.splus.ir/apiws...")
 
 	// 1. Establish custom obfuscated signaling session
@@ -106,24 +107,27 @@ func getOrRefreshDynamicToken(ctx context.Context, cfg *models.SoroushTunnelConf
 	} else {
 		var err error
 		callID, callAccessHash, err = soroushlib.ResolveGroupCall(ctx, session, cfg.GroupChatID, cfg.GroupAccessHash)
-		if err != nil {
-			// If we are the server and no call is active, we attempt to create it
-			if isServer {
-				logger.Info(componentJit, "JIT: No active group call found, creating one...", "chat_id", cfg.GroupChatID)
-				if createErr := soroushlib.CreateGroupCall(ctx, session, cfg.GroupChatID, cfg.GroupAccessHash); createErr != nil {
-					return "", fmt.Errorf("failed to create group call: %w", createErr)
-				}
-				// Resolve again after creating
-				callID, callAccessHash, err = soroushlib.ResolveGroupCall(ctx, session, cfg.GroupChatID, cfg.GroupAccessHash)
-				if err != nil {
-					return "", fmt.Errorf("failed to resolve group call after creation: %w", err)
-				}
-			} else {
-				logger.Error(componentJit, "JIT: Auto-resolution failed to locate a running call instance. Optimization required.", "error", err)
-				return "", fmt.Errorf("resolution failed. Prerequisite: Ensure your account has joined group %d or use Static Call Overrides. Error: %w", cfg.GroupChatID, err)
+		if err != nil || callID == 0 {
+			logger.Warn(componentJit, "JIT: No active call found. Mimicking Web App to Create Group Video Call...")
+			
+			// 2. Automate Call Creation using the fixed Web App pattern
+			createErr := soroushlib.CreateGroupCall(ctx, session, cfg.GroupChatID, cfg.GroupAccessHash)
+			
+			if createErr != nil {
+				return "", fmt.Errorf("failed to create call automatically: %w", createErr)
+			}
+			
+			logger.Info(componentJit, "JIT: Call created successfully! Resolving new Call Identifiers...")
+			time.Sleep(2 * time.Second) // Give Soroush servers a moment to sync the new room
+			
+			// Re-resolve to get the newly created CallID
+			callID, callAccessHash, err = soroushlib.ResolveGroupCall(ctx, session, cfg.GroupChatID, cfg.GroupAccessHash)
+			if err != nil {
+				return "", fmt.Errorf("call created, but failed to resolve new ID: %w", err)
 			}
 		}
-		logger.Info(componentJit, "JIT: Dynamic call instance resolved successfully", "call_id", callID)
+
+		logger.Info(componentJit, "JIT: Active Room Identifiers Locked", "call_id", callID)
 	}
 
 	// 3. Handshake to fetch the LiveKit Token using the active session
