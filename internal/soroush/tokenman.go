@@ -22,6 +22,20 @@ const componentJit = "SoroushJit"
 // If the dynamic token resolution flow fails, it will automatically fall back to the manually-configured
 // FallbackLiveKitToken saved in the database config.
 func GetOrRefreshLiveKitToken(ctx context.Context, cfg *models.SoroushTunnelConfig, acct *models.SoroushAccount, isServer bool) (string, error) {
+	// 0. Direct JWT Override Check
+	if strings.HasPrefix(cfg.CallAccessHash, "eyJ") && !IsTokenExpired(cfg.CallAccessHash) {
+		logger.Info(componentJit, "JIT: Static CallAccessHash is a valid JWT. Using it directly.")
+		acct.LiveKitToken = cfg.CallAccessHash
+		db.DB.Save(acct)
+		return cfg.CallAccessHash, nil
+	}
+	if strings.HasPrefix(cfg.FallbackLiveKitToken, "eyJ") && !IsTokenExpired(cfg.FallbackLiveKitToken) {
+		logger.Info(componentJit, "JIT: FallbackLiveKitToken is a valid JWT. Using it directly.")
+		acct.LiveKitToken = cfg.FallbackLiveKitToken
+		db.DB.Save(acct)
+		return cfg.FallbackLiveKitToken, nil
+	}
+
 	// 1. Memory Cache Layer Validation
 	if acct.LiveKitToken != "" && !IsTokenExpired(acct.LiveKitToken) {
 		logger.Debug(componentJit, "JIT: Reusing active unexpired token from cache database.")
@@ -81,7 +95,7 @@ func getOrRefreshDynamicToken(ctx context.Context, cfg *models.SoroushTunnelConf
 
 	// 2. Resolve active CallID and CallAccessHash (either via static override or dynamic resolution)
 	var callID, callAccessHash int64
-	if cfg.CallID != 0 && cfg.CallAccessHash != "" {
+	if cfg.CallID != 0 && cfg.CallAccessHash != "" && !strings.HasPrefix(cfg.CallAccessHash, "eyJ") {
 		logger.Info(componentJit, "JIT: Static Call Routing detected. Skipping auto-resolution loops...", "call_id", cfg.CallID)
 		callID = cfg.CallID
 		var err error
