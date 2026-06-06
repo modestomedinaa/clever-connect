@@ -46,92 +46,97 @@ func main() {
 		log.Fatalf("failed to warm up Soroush session: %v", err)
 	}
 
-	chatID := int64(21791372)
-
-	// Step 1: Call messages.getFullChat
-	fmt.Printf("\n--- Method 2: messages.getFullChat ---\n")
-	bodyFullChat := soroushlib.BuildGetFullGroupRequest(chatID, 0)
-	wrappedFChat := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, bodyFullChat)
-	cidFChat, readerFChat, err := session.SendAndWait(ctx, wrappedFChat, true)
-	if err == nil {
-		fmt.Printf("getFullChat succeeded. CID: 0x%08X, size: %d bytes\n", cidFChat, len(readerFChat.GetData()))
-		dumpBytesAndInts(readerFChat.GetData())
-	} else {
-		fmt.Printf("getFullChat failed: %v\n", err)
+	// Step 1: Fetch dialogs to find the access hash of the chat
+	fmt.Printf("\n--- Fetching Dialogs ---\n")
+	body := soroushlib.BuildGetDialogsRequest()
+	wrapped := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, body)
+	_, reader, err := session.SendAndWait(ctx, wrapped, true)
+	if err != nil {
+		log.Fatalf("getDialogs RPC failed: %v", err)
 	}
 
-	// Step 2: Fetch Chat History as chat (accessHash = 0)
-	fmt.Printf("\n--- Method 3: messages.getHistory (chat mode) ---\n")
-	historyBody := soroushlib.BuildGetHistoryRequest(chatID, 0, 0, 0, 0, 100)
-	wrappedHist := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, historyBody)
-	cidHist, readerHist, err := session.SendAndWait(ctx, wrappedHist, true)
-	if err == nil {
-		fmt.Printf("getHistory succeeded. CID: 0x%08X, size: %d bytes\n", cidHist, len(readerHist.GetData()))
-		parseAndPrintCall(readerHist.GetData())
-	} else {
-		fmt.Printf("getHistory failed: %v\n", err)
-	}
-}
-
-func dumpBytesAndInts(data []byte) {
-	fmt.Printf("--- Raw data offsets, uint32 and int64 values ---\n")
-	for i := 0; i+4 <= len(data); i += 4 {
-		val := uint32(data[i]) | uint32(data[i+1])<<8 | uint32(data[i+2])<<16 | uint32(data[i+3])<<24
-		
-		// If 8-byte aligned, print as int64 too
-		var int64str string
-		if i%8 == 0 && i+8 <= len(data) {
-			val64 := int64(uint64(data[i]) | uint64(data[i+1])<<8 | uint64(data[i+2])<<16 | uint64(data[i+3])<<24 |
-				uint64(data[i+4])<<32 | uint64(data[i+5])<<40 | uint64(data[i+6])<<48 | uint64(data[i+7])<<56)
-			int64str = fmt.Sprintf(" | int64: %d (0x%016X)", val64, uint64(val64))
-		}
-		
-		// Also show hex representation of the 4 bytes
-		hexBytes := fmt.Sprintf("%02x %02x %02x %02x", data[i], data[i+1], data[i+2], data[i+3])
-		fmt.Printf("Offset %3d: hex: %s | uint32: 0x%08X (%d)%s\n", i, hexBytes, val, val, int64str)
-	}
-}
-
-func parseAndPrintCall(raw []byte) {
-	target := []byte{0x0f, 0x84, 0xaa, 0xd8} // InputGroupCall (d8aa840f)
+	raw := reader.GetData()
+	targetID := int64(21791372)
+	
+	var accessHash int64 = 0
 	found := false
-	for i := 0; i <= len(raw)-20; i++ {
-		if raw[i] == target[0] && raw[i+1] == target[1] && raw[i+2] == target[2] && raw[i+3] == target[3] {
-			cr := soroushlib.NewTLReader(raw[i+4:])
-			id, err1 := cr.ReadInt64()
-			accessHash, err2 := cr.ReadInt64()
-			if err1 == nil && err2 == nil {
-				fmt.Printf("  >>> FOUND ACTIVE CALL IN RESPONSE: ID=%d, AccessHash=%d <<<\n", id, accessHash)
-				found = true
-			}
-		}
-	}
 
-	gcTarget := []byte{0x0c, 0x65, 0x97, 0xd5} // groupCall (d597650c)
-	for i := 0; i <= len(raw)-20; i++ {
-		if raw[i] == gcTarget[0] && raw[i+1] == gcTarget[1] && raw[i+2] == gcTarget[2] && raw[i+3] == gcTarget[3] {
+	// Scan raw bytes for channel constructor: 0x8E87CCD8
+	target := []byte{0xd8, 0xcc, 0x87, 0x8e} // 0x8E87CCD8
+	for i := 0; i <= len(raw)-32; i++ {
+		if raw[i] == target[0] && raw[i+1] == target[1] &&
+			raw[i+2] == target[2] && raw[i+3] == target[3] {
+			
 			cr := soroushlib.NewTLReader(raw[i+4:])
-			flags, _ := cr.ReadInt32()
-			id, _ := cr.ReadInt64()
-			accessHash, _ := cr.ReadInt64()
-			fmt.Printf("  >>> FOUND groupCall OBJECT: ID=%d, AccessHash=%d, Flags=0x%08X <<<\n", id, accessHash, flags)
-			found = true
+			flags, err1 := cr.ReadInt32()
+			flags2, err2 := cr.ReadInt32()
+			id, err3 := cr.ReadInt64()
+			
+			if err1 == nil && err2 == nil && err3 == nil && id == targetID {
+				fmt.Printf("Found Channel in Dialogs: ID=%d, Flags=0x%08X, Flags2=0x%08X\n", id, flags, flags2)
+				if (flags & (1 << 13)) != 0 {
+					hash, err4 := cr.ReadInt64()
+					if err4 == nil {
+						accessHash = hash
+						found = true
+						fmt.Printf("  >>> ACCESS HASH = %d (0x%016X) <<<\n", accessHash, uint64(accessHash))
+					}
+				}
+			}
 		}
 	}
 
 	if !found {
-		// Scan and list potential constructor IDs
-		var cids []string
-		for i := 0; i+4 <= len(raw); i += 4 {
-			val := uint32(raw[i]) | uint32(raw[i+1])<<8 | uint32(raw[i+2])<<16 | uint32(raw[i+3])<<24
-			if val > 0x01000000 && val < 0xffffff00 {
-				cids = append(cids, fmt.Sprintf("offset %d: 0x%08X", i, val))
-			}
+		log.Fatalf("Could not find channel %d in dialogs.", targetID)
+	}
+
+	// Step 2: Query channels.getFullChannel
+	fmt.Printf("\n--- Querying channels.getFullChannel ---\n")
+	wFull := soroushlib.NewTLWriter()
+	wFull.WriteUint32(0x08736A09) // channels.getFullChannel
+	wFull.WriteUint32(0xf35aec28) // inputChannel
+	wFull.WriteInt64(targetID)
+	wFull.WriteInt64(accessHash)
+
+	cid, rFull, err := session.SendAndWait(ctx, wFull.GetBytes(), true)
+	if err != nil {
+		log.Fatalf("getFullChannel RPC failed: %v", err)
+	}
+
+	if cid == soroushlib.IDRPCError {
+		log.Fatalf("getFullChannel returned RPC error: %v", soroushlib.ParseRPCError(rFull))
+	}
+
+	rawFull := rFull.GetData()
+	fmt.Printf("getFullChannel succeeded. Response CID: 0x%08X, Response size: %d bytes\n", cid, len(rawFull))
+	
+	// Dump hex
+	fmt.Printf("Raw hex:\n")
+	for i := 0; i < len(rawFull); i += 16 {
+		end := i + 16
+		if end > len(rawFull) {
+			end = len(rawFull)
 		}
-		if len(cids) > 10 {
-			fmt.Printf("  Potential Constructor IDs (first 10): %v\n", cids[:10])
-		} else if len(cids) > 0 {
-			fmt.Printf("  Potential Constructor IDs: %v\n", cids)
+		fmt.Printf("%04d: ", i)
+		for _, b := range rawFull[i:end] {
+			fmt.Printf("%02x ", b)
+		}
+		fmt.Printf("\n")
+	}
+
+	// List all potential constructor IDs (4-byte alignment or slide by 1 byte)
+	fmt.Printf("\nPotential Constructor IDs (sliding):\n")
+	for i := 0; i <= len(rawFull)-4; i++ {
+		val := uint32(rawFull[i]) | uint32(rawFull[i+1])<<8 | uint32(rawFull[i+2])<<16 | uint32(rawFull[i+3])<<24
+		// If it's a known CID or looks like one
+		if val == 0xB2264016 {
+			fmt.Printf("Found InputConferenceCall (0xB2264016) at offset %d!\n", i)
+		} else if val == 0xF36441D5 {
+			fmt.Printf("Found ConferenceCall (0xF36441D5) at offset %d!\n", i)
+		} else if val == 0x278E3AE9 {
+			fmt.Printf("Found conference.conferenceCall (0x278E3AE9) at offset %d!\n", i)
+		} else if val == 0xD8AA840F {
+			fmt.Printf("Found InputGroupCall (0xD8AA840F) at offset %d!\n", i)
 		}
 	}
 }
