@@ -374,23 +374,41 @@ func base64URLDecode(s string) ([]byte, error) {
 	return base64.URLEncoding.DecodeString(s)
 }
 
-// ScanForInputGroupCall scans raw TL response bytes for InputGroupCall constructor (0xD8AA840F)
-// and returns the group call ID and access hash if found.
+// ScanForInputGroupCall scans raw TL response bytes for either InputGroupCall constructor (0xD8AA840F)
+// or the live server-side GroupCall constructor (0xD597650C) and returns the verified call metadata.
 func ScanForInputGroupCall(data []byte) (int64, int64, bool) {
-	// Little-endian representation of 0xD8AA840F
-	target := []byte{0x0f, 0x84, 0xaa, 0xd8}
+	// 1. Primary Check: Scan for inputGroupCall#d8aa840f (Little-Endian: 0f 84 aa d8)
+	targetInput := []byte{0x0f, 0x84, 0xaa, 0xd8}
 	for i := 0; i <= len(data)-20; i++ {
-		if data[i] == target[0] && data[i+1] == target[1] &&
-			data[i+2] == target[2] && data[i+3] == target[3] {
+		if data[i] == targetInput[0] && data[i+1] == targetInput[1] &&
+			data[i+2] == targetInput[2] && data[i+3] == targetInput[3] {
 			
-			r := NewTLReader(data[i+4:])
+			r := NewTLReader(data[i+4:]) // Skip constructor ID (4 bytes)
 			id, err1 := r.ReadInt64()
 			accessHash, err2 := r.ReadInt64()
-			if err1 == nil && err2 == nil {
+			if err1 == nil && err2 == nil && id != 0 {
 				return id, accessHash, true
 			}
 		}
 	}
+
+	// 2. Fallback Check: Scan for live groupCall#d597650c (Little-Endian: 0c 65 97 d5)
+	// Layout structure: constructor (4 bytes) + flags (4 bytes) + id (8 bytes) + access_hash (8 bytes)
+	targetLive := []byte{0x0c, 0x65, 0x97, 0xd5}
+	for i := 0; i <= len(data)-24; i++ {
+		if data[i] == targetLive[0] && data[i+1] == targetLive[1] &&
+			data[i+2] == targetLive[2] && data[i+3] == targetLive[3] {
+			
+			// Skip constructor (4 bytes) + flags field (4 bytes) = 8 bytes offset total
+			r := NewTLReader(data[i+8:])
+			id, err1 := r.ReadInt64()
+			accessHash, err2 := r.ReadInt64()
+			if err1 == nil && err2 == nil && id != 0 {
+				return id, accessHash, true
+			}
+		}
+	}
+
 	return 0, 0, false
 }
 

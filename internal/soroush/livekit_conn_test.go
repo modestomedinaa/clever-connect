@@ -79,3 +79,38 @@ func TestLiveKitAddr(t *testing.T) {
 
 	var _ net.Addr = addr
 }
+
+func TestCloseSafety(t *testing.T) {
+	localTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
+		MimeType:  webrtc.MimeTypeOpus,
+		ClockRate: 48000,
+		Channels:  2,
+	}, "tunnel-quic", "tunnel")
+	if err != nil {
+		t.Fatalf("Failed to create local track: %v", err)
+	}
+
+	conn := NewRtpPacketConn(localTrack)
+
+	// Close first
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Double close safety check
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Second Close failed: %v", err)
+	}
+
+	// Recover helper to capture panic if it happens
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("PushRx panicked on closed connection: %v", r)
+		}
+	}()
+
+	// Push after close should not panic, it should return silently
+	payload := []byte{0x51, 0x01, 0x02, 0x03}
+	conn.PushRx(payload, "client-A")
+}
+
